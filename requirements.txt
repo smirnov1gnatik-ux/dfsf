@@ -1,1 +1,5 @@
 aiogram==3.*
+aiohttp==3.*
+playwright==1.*
+apscheduler==3.*
+jinja2==3.*

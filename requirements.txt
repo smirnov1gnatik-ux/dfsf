@@ -1,5 +1,5 @@
-aiogram==3.*
-aiohttp==3.*
-playwright==1.*
-apscheduler==3.*
-jinja2==3.*
+aiogram>=3.7,<4.0
+aiohttp>=3.9
+playwright>=1.45
+apscheduler>=3.10
+jinja2>=3.1

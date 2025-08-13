@@ -1,7 +1,7 @@
-# main.py — Trust Wallet-style screenshot bot (aiogram 3.7+)
-# Binance→CG→cache, 24h change, проценты от "базы" (/setup),
-# Trust UI (иконки, пилюли сетей, формат чисел как на скрине),
-# инлайн-кнопки, плановые отправки, Playwright auto-install.
+# main.py — Trust Wallet-style screenshot bot + "mini-AI" render controller
+# aiogram 3.7+, Playwright; Binance→CG→cache; 24h change; base-% from /setup;
+# Inline buttons; daily schedule; auto-install Chromium (no root);
+# NEW: reference screenshot upload (/refpic), dHash QA, auto-scaling re-render.
 
 import asyncio
 import json
@@ -24,6 +24,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from jinja2 import Template
+from PIL import Image
 from playwright.async_api import async_playwright
 
 # ------------ Config ------------
@@ -32,16 +33,18 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан.")
 
 COINGECKO_IDS = {"ZRO": "layerzero", "BNB": "binancecoin", "USDT": "tether"}
-
-# подписи сетей (лейбл под названием монеты)
 CHAIN_LABEL = {"ZRO": "BNB Smart Chain", "BNB": "BNB Smart Chain", "USDT": "BNB Smart Chain"}
 
 DB_PATH = "bot.db"
 CACHE_PATH = Path("prices_cache.json")
 CACHE_TTL_SECONDS = 180
 PLAYWRIGHT_BROWSERS_PATH = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
-# ---------------------------------
 
+# пути для эталона и последнего кадра
+REF_DIR = Path("refs"); REF_DIR.mkdir(exist_ok=True)
+def ref_path(user_id:int) -> Path: return REF_DIR / f"ref_{user_id}.png"
+
+# ---------------------------------
 def ensure_playwright_chromium():
     try:
         if PLAYWRIGHT_BROWSERS_PATH.exists() and any(PLAYWRIGHT_BROWSERS_PATH.rglob("headless_shell")):
@@ -56,7 +59,6 @@ def ensure_playwright_chromium():
 
 # -------- Helpers: RU formatting --------
 def fmt_amount(x: float, decimals: int = 4) -> str:
-    # 0.0043 -> "0,0043"; 1040 -> "1040"
     if float(x).is_integer():
         s = f"{x:.0f}"
     else:
@@ -64,14 +66,32 @@ def fmt_amount(x: float, decimals: int = 4) -> str:
     return s.replace(".", ",")
 
 def fmt_money(x: float) -> str:
-    # 36.06 -> "36,06 $"
     s = f"{x:,.2f}".replace(",", " ").replace(".", ",")
     return f"{s} $"
 
 def fmt_price(x: float) -> str:
-    # 2.3 -> "2,3000 $/шт"
     s = f"{x:,.4f}".replace(",", " ").replace(".", ",")
     return f"{s} $/шт"
+
+# -------- dHash (перцептивная похожесть) --------
+def dhash_score(path_a: Path, path_b: Path, hash_size: int = 16) -> int:
+    """
+    Меньше — лучше. 0 = идентично по dHash. Обычно до 10-15 — очень похоже.
+    """
+    def _d(path: Path) -> int:
+        img = Image.open(path).convert("L").resize((hash_size + 1, hash_size), Image.BILINEAR)
+        pixels = list(img.getdata())
+        rows = [pixels[i * (hash_size + 1):(i + 1) * (hash_size + 1)] for i in range(hash_size)]
+        diff_bits = []
+        for row in rows:
+            for x in range(hash_size):
+                diff_bits.append(1 if row[x] > row[x + 1] else 0)
+        val = 0
+        for bit in diff_bits:
+            val = (val << 1) | bit
+        return val
+    ha, hb = _d(path_a), _d(path_b)
+    return bin(ha ^ hb).count("1")
 
 # -------- DB --------
 def db_init():
@@ -89,6 +109,11 @@ def db_init():
             created_at TEXT,
             daily_hour INTEGER,
             daily_minute INTEGER
+        )""")
+        # флаг ожидания эталона
+        con.execute("""CREATE TABLE IF NOT EXISTS ref_state (
+            user_id INTEGER PRIMARY KEY,
+            waiting INTEGER DEFAULT 0
         )""")
         con.commit()
 
@@ -121,6 +146,20 @@ def upsert_profile(user_id: int, amounts: dict, baselines: dict, schedule_time: 
         ))
         con.commit()
 
+def set_waiting_ref(user_id:int, val:int):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+        INSERT INTO ref_state(user_id, waiting) VALUES(?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET waiting=excluded.waiting
+        """, (user_id, val))
+        con.commit()
+
+def get_waiting_ref(user_id:int) -> int:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("SELECT waiting FROM ref_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
 # -------- Cache --------
 def _cache_read() -> Optional[dict]:
     if CACHE_PATH.exists():
@@ -138,8 +177,7 @@ def _cache_write(prices: dict):
 
 # -------- Prices: Binance → CoinGecko → cache --------
 async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], str]:
-    # A) Binance (price + 24h change)
-    try:
+    try:  # Binance
         async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", timeout=15) as r1, \
                    session.get("https://api.binance.com/api/v3/ticker/price?symbol=ZROUSDT", timeout=15) as r2, \
                    session.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT", timeout=15) as r3, \
@@ -154,7 +192,7 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], 
             return prices, "binance"
     except Exception:
         pass
-    # B) CoinGecko (fallback)
+    # CoinGecko fallback
     ids = ",".join(COINGECKO_IDS.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
     backoffs = [0.5,1.2,2.5,5.0]
@@ -171,8 +209,7 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], 
                 _cache_write({"ZRO":prices["ZRO"]["price"],"BNB":prices["BNB"]["price"],"USDT":prices["USDT"]["price"]})
                 return prices, "coingecko"
         except aiohttp.ClientResponseError:
-            if i < len(backoffs)-1:
-                await asyncio.sleep(d); continue
+            if i < len(backoffs)-1: await asyncio.sleep(d); continue
             cached = _cache_read()
             if cached:
                 return {"ZRO":{"price":float(cached["ZRO"]),"h24":None},
@@ -193,7 +230,7 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], 
                 "USDT":{"price":float(cached["USDT"]),"h24":0.0}}, "cache"
     raise RuntimeError("Нет источника цен")
 
-# -------- SVG иконки (в т.ч. маленький BSC-бейдж) --------
+# -------- SVG icons --------
 ICON_BNB = """<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
 <circle cx="18" cy="18" r="18" fill="#0B101A"/>
 <path d="M18 6l4.8 4.8-2 2L18 10l-2.8 2.8-2-2L18 6zm7.5 7.5l2 2-2 2-2-2 2-2zM18 12.5l3.5 3.5L18 19.5l-3.5-3.5L18 12.5zm-7.5 1l2 2-2 2-2-2 2-2zM18 22l2.8-2.8 2 2L18 28l-4.8-4.8 2-2L18 22z" fill="#F3BA2F"/>
@@ -206,45 +243,42 @@ ICON_ZRO = """<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.
 <circle cx="18" cy="18" r="18" fill="#6C5CE7"/>
 <text x="18" y="22" font-size="12" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-weight="700">ZRO</text>
 </svg>"""
-# Маленький бейдж BSC поверх иконки
 BADGE_BSC = """<svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
 <circle cx="9" cy="9" r="9" fill="#0B101A"/><path d="M9 2.8l2.1 2.1-0.9.9L9 4.6 7.8 5.8l-0.9-0.9L9 2.8zM12.3 6.1l0.9 0.9-0.9 0.9-0.9-0.9 0.9-0.9zM9 5.6l1.6 1.6L9 8.8 7.4 7.2 9 5.6zM5.7 6.1l0.9 0.9-0.9 0.9-0.9-0.9 0.9-0.9zM9 9.9l1.2-1.2 0.9 0.9L9 12.9 6.9 10.8l0.9-0.9L9 9.9z" fill="#F3BA2F"/>
 </svg>"""
 
 def icon_for(symbol:str) -> str:
-    if symbol.upper() == "BNB": return ICON_BNB
-    if symbol.upper() == "USDT": return ICON_USDT
-    return ICON_ZRO  # ZRO и fZRO рисуем одинаково
+    return ICON_BNB if symbol.upper()=="BNB" else ICON_USDT if symbol.upper()=="USDT" else ICON_ZRO
 
-# -------- Trust Wallet-like HTML --------
+# -------- Trust-like template (с масштабированием) --------
 WALLET_TEMPLATE = """
 <!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trust-like</title>
 <style>
-  :root{--muted:#6b7280;--green:#16a34a;--red:#dc2626;--pill:#EEF0F4}
+  :root{--muted:#6b7280;--green:#16a34a;--red:#dc2626;--pill:#EEF0F4; --S: {{SCALE}};}
   *{box-sizing:border-box}
   body{margin:0;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Ubuntu,Cantarell,Arial}
-  .screen{width:390px;margin:0 auto;background:#fff}
-  .top{display:flex;align-items:center;justify-content:center;height:44px;padding:0 12px;font-size:15px}
+  .screen{width:390px;margin:0 auto;background:#fff; transform: scale(var(--S)); transform-origin: top left;}
+  .top{display:flex;align-items:center;justify-content:center;height:calc(44px*var(--S));padding:0 12px;font-size:calc(15px*var(--S))}
   .balance{padding:10px 16px}
-  .bal-num{font-size:40px;font-weight:800;letter-spacing:.3px}
-  .bal-delta{color:var(--green);font-weight:700;margin-top:4px}
-  .actions{display:flex;justify-content:space-between;padding:8px 16px 12px}
-  .act{width:78px;height:78px;border-radius:20px;background:#F1F3F7;display:flex;align-items:center;justify-content:center;font-weight:700}
+  .bal-num{font-size:calc(40px*var(--S));font-weight:800;letter-spacing:.3px}
+  .bal-delta{color:var(--green);font-weight:700;margin-top:4px;font-size:calc(15px*var(--S))}
+  .actions{display:flex;justify-content:space-between;padding:8px 16px 12px;gap:8px}
+  .act{width:calc(78px*var(--S));height:calc(78px*var(--S));border-radius:20px;background:#F1F3F7;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:calc(13px*var(--S))}
   .tabs{display:flex;gap:18px;padding:6px 16px 0;font-weight:800}
   .tabs .on{color:#1f4cff}
   .list{padding:8px 10px 16px}
   .row{display:flex;align-items:center;justify-content:space-between;padding:12px 8px;border-bottom:1px solid #f0f0f0}
   .left{display:flex;align-items:center;gap:10px}
-  .icon-wrap{position:relative;width:36px;height:36px}
-  .badge{position:absolute;left:-6px;bottom:-4px}
-  .name{font-weight:800}
-  .pill{display:inline-block;background:var(--pill);color:#3b3b3b;padding:4px 10px;border-radius:999px;font-size:12px;margin-top:4px}
+  .icon-wrap{position:relative;width:calc(36px*var(--S));height:calc(36px*var(--S))}
+  .badge{position:absolute;left:-6px;bottom:-4px; transform: scale(var(--S)); transform-origin: left bottom;}
+  .name{font-weight:800;font-size:calc(16px*var(--S))}
+  .pill{display:inline-block;background:var(--pill);color:#3b3b3b;padding:calc(4px*var(--S)) calc(10px*var(--S));border-radius:999px;font-size:calc(12px*var(--S));margin-top:4px}
   .right{text-align:right}
-  .usd{font-weight:800}
-  .sub{font-size:13px;color:var(--muted);margin-top:2px}
+  .usd{font-weight:800;font-size:calc(16px*var(--S))}
+  .sub{font-size:calc(13px*var(--S));color:var(--muted);margin-top:2px}
   .h24.up{color:var(--green)} .h24.down{color:var(--red)}
   .manage{padding:18px 16px;color:#0a58ff;font-weight:800}
   .navbar{height:70px;border-top:1px solid #eee}
@@ -297,10 +331,8 @@ WALLET_TEMPLATE = """
 </body></html>
 """
 
-# -------- Render --------
-async def render_wallet_screenshot(playwright, items:list, total_usd:float, total_pct:float=0.0) -> str:
-    # items: [{SYMBOL, AMOUNT_F, PRICE_F, VALUE_F, H24}]
-    # Соберём итоговые строки с нужным форматированием
+# -------- Render ----------
+async def render_wallet_html(total_usd:float, total_pct:float, items:list, scale:float) -> str:
     mapped = []
     for it in items:
         mapped.append({
@@ -308,68 +340,87 @@ async def render_wallet_screenshot(playwright, items:list, total_usd:float, tota
             "BADGE": BADGE_BSC,
             "SYMBOL": it["SYMBOL"],
             "CHAIN": CHAIN_LABEL.get(it["SYMBOL"], "BNB Smart Chain"),
-            "VALUE": fmt_money(it["VALUE_F"]).replace(" $",""),  # в шаблоне добавляем " $"
+            "VALUE": fmt_money(it["VALUE_F"]).replace(" $",""),
             "PRICE": fmt_price(it["PRICE_F"]),
             "H24": None if it.get("H24") is None else round(float(it["H24"]), 2),
         })
-
-    # шапка баланса как на скрине: число + стрелка, показываем текущий портфель и его % от базы
     balance_text = fmt_money(total_usd)
     delta_text = f"{fmt_money(total_usd * abs(total_pct)/100)} (+{total_pct}% от базы)" if total_pct >= 0 else f"{fmt_money(total_usd * abs(total_pct)/100)} ({total_pct}% от базы)"
-
     html = Template(WALLET_TEMPLATE).render(
         BALANCE=balance_text.replace(" $"," $"),
         BALANCE_DELTA=delta_text.replace(" $"," $"),
-        ITEMS=mapped
+        ITEMS=mapped, SCALE=scale
     )
-
     path_html = "wallet.html"
-    with open(path_html, "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(path_html, "w", encoding="utf-8") as f: f.write(html)
+    return path_html
 
+async def screenshot_html(playwright, html_path:str, out_path:str="wallet.png", width:int=390, height:int=844) -> str:
     browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-    ctx = await browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2)
+    ctx = await browser.new_context(viewport={"width": width, "height": height}, device_scale_factor=2)
     page = await ctx.new_page()
-    await page.goto("file://" + os.path.abspath(path_html))
-    height = await page.evaluate("document.documentElement.scrollHeight")
-    await page.set_viewport_size({"width": 390, "height": height})
-    out = "wallet.png"
-    await page.screenshot(path=out, full_page=True)
-    await ctx.close()
-    await browser.close()
-    return out
+    await page.goto("file://" + os.path.abspath(html_path))
+    h = await page.evaluate("document.documentElement.scrollHeight")
+    await page.set_viewport_size({"width": width, "height": h})
+    await page.screenshot(path=out_path, full_page=True)
+    await ctx.close(); await browser.close()
+    return out_path
+
+async def render_with_ai_control(playwright, items:list, total_usd:float, total_pct:float, user_id:int) -> tuple[str, str]:
+    """
+    Рендер с QA: пробуем несколько масштабов и выбираем наиболее похожий к эталону, если он есть.
+    Возвращает (path, note)
+    """
+    ref = ref_path(user_id)
+    scales = [0.92, 1.00, 1.08]
+    best = None
+    best_score = None
+    note = ""
+    for sc in scales:
+        html = await render_wallet_html(total_usd, total_pct, items, sc)
+        out = f"wallet_{str(sc).replace('.','_')}.png"
+        path = await screenshot_html(playwright, html, out)
+        score = None
+        if ref.exists():
+            score = dhash_score(ref, Path(path))
+            if best_score is None or score < best_score:
+                best, best_score = path, score
+        else:
+            # нет эталона — берём базовый 1.00
+            if sc == 1.00:
+                best, best_score = path, -1
+                break
+    if best is None:
+        # на всякий случай
+        html = await render_wallet_html(total_usd, total_pct, items, 1.00)
+        best = await screenshot_html(playwright, html, "wallet.png")
+        note = "без эталона"
+    else:
+        if best_score == -1:
+            note = "эталон не задан"
+        else:
+            note = f"похожесть dHash={best_score} (меньше — лучше)"
+    return best, note
 
 # -------- Business logic --------
 def parse_setup(body: str):
-    """
-    Пример:
-    ZRO 750.034
-    BNB 0.01
-    USDT 0
-    fZRO 1040
-    at 18:30
-    """
     amounts = {"ZRO":0.0,"BNB":0.0,"USDT":0.0,"fZRO":0.0}
     hour = minute = None
     for raw in body.splitlines():
         s = raw.strip()
-        if not s: 
-            continue
+        if not s: continue
         low = s.lower()
         if low.startswith("at "):
             try:
                 hh, mm = low.replace("at","",1).strip().split(":")
                 hour, minute = int(hh), int(mm)
-            except Exception:
-                pass
+            except Exception: pass
             continue
         parts = s.replace(",", ".").split()
         if len(parts) >= 2:
             key = parts[0].upper()
-            try:
-                val = float(parts[1])
-            except Exception:
-                continue
+            try: val = float(parts[1])
+            except Exception: continue
             if key in ("ZRO","BNB","USDT","FZRO"):
                 amounts["fZRO" if key=="FZRO" else key] = val
     sched = (hour, minute) if hour is not None and minute is not None else None
@@ -379,49 +430,25 @@ async def compute_snapshot(user_id:int):
     prof = get_profile(user_id)
     if not prof:
         return None, "Сначала выполните /setup — укажите количества токенов."
-
     async with aiohttp.ClientSession() as sess:
         prices, source = await fetch_prices(sess)
-
     pzro, pbnb, pusdt = prices["ZRO"]["price"], prices["BNB"]["price"], prices["USDT"]["price"]
     zro24, bnb24, usdt24 = prices["ZRO"]["h24"], prices["BNB"]["h24"], prices["USDT"]["h24"]
-
     bzro, bbnb, busdt = prof["baseline_zro"], prof["baseline_bnb"], prof["baseline_usdt"]
-
-    def pct(now, base):
-        if not base or base == 0:
-            return 0.0
-        return round((now - base) / base * 100, 2)
-
-    rows = []
-    # Порядок: ZRO (норм), BNB, USDT, ZRO (пустышка)
+    def pct(now, base): return 0.0 if not base or base==0 else round((now-base)/base*100,2)
     entries = [
         ("ZRO", prof["zro"], pzro, pct(pzro, bzro), zro24),
         ("BNB", prof["bnb"], pbnb, pct(pbnb, bbnb), bnb24),
         ("USDT", prof["usdt"], pusdt, pct(pusdt, busdt), usdt24),
         ("ZRO", prof["fzro"], pzro, pct(pzro, bzro), zro24),
     ]
-    total_val = 0.0
-    weighted_parts = []
-    items_for_render = []
+    total_val = 0.0; weighted_parts=[]; items=[]
     for sym, amount, price, change, h24 in entries:
-        value_f = amount * price
-        total_val += value_f
-        weighted_parts.append((value_f, change))
-        items_for_render.append({
-            "SYMBOL": sym,
-            "AMOUNT_F": amount,
-            "PRICE_F": price,
-            "VALUE_F": round(value_f, 2),
-            "CHANGE_PCT": change,
-            "H24": h24
-        })
-
-    total_pct = 0.0
-    if total_val > 0:
-        total_pct = round(sum(v/total_val * c for v, c in weighted_parts), 2)
-
-    return {"items": items_for_render, "total_usd": total_val, "total_pct": total_pct, "source": source}, None
+        value_f = amount * price; total_val += value_f; weighted_parts.append((value_f, change))
+        items.append({"SYMBOL": sym, "AMOUNT_F": amount, "PRICE_F": price, "VALUE_F": round(value_f,2),
+                      "CHANGE_PCT": change, "H24": h24})
+    total_pct = 0.0 if total_val<=0 else round(sum(v/total_val * c for v,c in weighted_parts), 2)
+    return {"items": items, "total_usd": total_val, "total_pct": total_pct, "source": source}, None
 
 # -------- Scheduler --------
 scheduler = AsyncIOScheduler()
@@ -432,14 +459,13 @@ def schedule_user_job(user_id:int, hour:int, minute:int, bot: Bot, playwright):
     trigger = CronTrigger(hour=hour, minute=minute, timezone="UTC")
     async def job():
         snap, err = await compute_snapshot(user_id)
-        if err:
-            await bot.send_message(user_id, err, reply_markup=menu_kb()); return
-        path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
-        cap = f"Плановый снимок {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        if err: await bot.send_message(user_id, err, reply_markup=menu_kb()); return
+        best, note = await render_with_ai_control(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0), user_id)
+        cap = f"Плановый снимок {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • {note}"
         src = snap.get("source")
         if src == "cache": cap += " • цены из кэша"
         elif src == "binance": cap += " • цены: Binance"
-        await bot.send_photo(user_id, FSInputFile(path), caption=cap, reply_markup=menu_kb())
+        await bot.send_photo(user_id, FSInputFile(best), caption=cap, reply_markup=menu_kb())
     scheduler.add_job(job, trigger, id=job_id)
 
 # -------- Buttons --------
@@ -451,6 +477,7 @@ def menu_kb():
             InlineKeyboardButton(text="🛠 Шаблон /setup", callback_data="send_setup_template"),
             InlineKeyboardButton(text="⏰ Задать время", callback_data="set_time_utc"),
         ],
+        [InlineKeyboardButton(text="🖼 Задать эталон /refpic", callback_data="refpic_hint")]
     ])
 
 # -------- Bot --------
@@ -461,18 +488,47 @@ PLAYWRIGHT = None
 async def cmd_start(m: Message):
     await m.answer(
         "Привет! Делаю скрины кошелька в стиле Trust Wallet (ZRO/BNB/USDT и fZRO).\n"
-        "Кнопки снизу помогут настроить.",
+        "Новое: можно задать эталон скрина /refpic — бот будет подгонять рендер под него.",
         reply_markup=menu_kb()
     )
+
+@dp.message(Command("refpic"))
+async def cmd_refpic(m: Message):
+    set_waiting_ref(m.from_user.id, 1)
+    await m.answer("Пришлите **фото/скрин** Trust Wallet в ответ на это сообщение — сохраню как эталон. Потом нажмите «📸 Скрин сейчас».", reply_markup=menu_kb())
+
+@dp.message(F.photo)
+async def on_photo(m: Message, bot: Bot):
+    if not get_waiting_ref(m.from_user.id):
+        return
+    try:
+        file = await bot.get_file(m.photo[-1].file_id)
+        dest = ref_path(m.from_user.id)
+        await bot.download(file, destination=dest)
+        set_waiting_ref(m.from_user.id, 0)
+        await m.answer("Эталон сохранён ✅ Теперь жмите «📸 Скрин сейчас».", reply_markup=menu_kb())
+    except Exception as e:
+        await m.answer(f"Не удалось сохранить эталон: {e}", reply_markup=menu_kb())
+
+@dp.message(Command("qa"))
+async def cmd_qa(m: Message):
+    rp = ref_path(m.from_user.id)
+    if not rp.exists():
+        await m.answer("Эталон не задан. Сначала выполните /refpic и пришлите скрин.", reply_markup=menu_kb()); return
+    # делаем быстрый тест: рендер с scale=1.00 и метрика
+    snap, err = await compute_snapshot(m.from_user.id)
+    if err: await m.answer(err, reply_markup=menu_kb()); return
+    html = await render_wallet_html(snap["total_usd"], snap.get("total_pct",0.0), snap["items"], 1.00)
+    out = await screenshot_html(PLAYWRIGHT, html, "qa_test.png")
+    score = dhash_score(rp, Path(out))
+    await m.answer_photo(FSInputFile(out), caption=f"QA: dHash={score} (меньше — лучше)", reply_markup=menu_kb())
 
 @dp.message(Command("setup"))
 async def cmd_setup(m: Message):
     parts = m.text.split("\n", 1)
     body = parts[1] if len(parts) > 1 else ""
     if not body.strip():
-        await m.answer("Отправьте /setup и в теле значения.\nПример:\n\n"
-                       "ZRO 750.034\nBNB 0.01\nUSDT 0\nfZRO 1040\nat 18:30",
-                       reply_markup=menu_kb()); return
+        await m.answer("Отправьте /setup и в теле значения.\nПример:\n\nZRO 750.034\nBNB 0.01\nUSDT 0\nfZRO 1040\nat 18:30", reply_markup=menu_kb()); return
     amounts, sched = parse_setup(body)
     try:
         async with aiohttp.ClientSession() as sess:
@@ -485,10 +541,8 @@ async def cmd_setup(m: Message):
     msg = ("Сохранено ✅\n"
            f"ZRO: {amounts['ZRO']}\nBNB: {amounts['BNB']}\nUSDT: {amounts['USDT']}\n"
            f"fZRO: {amounts['fZRO']}\n"
-           f"Базовые цены (USD): ZRO={prices['ZRO']['price']:.4f}, BNB={prices['BNB']['price']:.4f}, USDT={prices['USDT']['price']:.4f}\n"
-           f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='coingecko' else 'кэш')}\n")
-    msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC." if sched else "Плановая отправка не задана."
-    await m.answer(msg, reply_markup=menu_kb())
+           f"Базовые цены (USD): ZRO={baselines['ZRO']:.4f}, BNB={baselines['BNB']:.4f}, USDT={baselines['USDT']:.4f}\n")
+    await m.answer(msg + ("Плановая отправка ежедневно в %02d:%02d UTC." % sched if sched else "Плановая отправка не задана."), reply_markup=menu_kb())
 
 @dp.message(Command("time"))
 async def cmd_time(m: Message):
@@ -500,8 +554,7 @@ async def cmd_time(m: Message):
     except Exception:
         await m.answer("Неверный формат времени.", reply_markup=menu_kb()); return
     prof = get_profile(m.from_user.id)
-    if not prof:
-        await m.answer("Сначала выполните /setup.", reply_markup=menu_kb()); return
+    if not prof: await m.answer("Сначала выполните /setup.", reply_markup=menu_kb()); return
     upsert_profile(m.from_user.id,
         {"ZRO": prof["zro"], "BNB": prof["bnb"], "USDT": prof["usdt"], "fZRO": prof["fzro"]},
         {"ZRO": prof["baseline_zro"], "BNB": prof["baseline_bnb"], "USDT": prof["baseline_usdt"]},
@@ -518,9 +571,6 @@ async def cmd_prices(m: Message):
     for r in snap["items"]:
         h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{round(r.get('H24') or 0,2)}%" if r.get("H24") is not None else ""
         lines.append(f"{r['SYMBOL']}: {fmt_amount(r['AMOUNT_F'])} шт • {fmt_price(r['PRICE_F'])} • {fmt_money(r['VALUE_F'])}{h24}")
-    src = snap.get("source")
-    if src == "cache": lines.append("⚠️ Цены из кэша.")
-    elif src == "binance": lines.append("Источник цен: Binance.")
     await m.answer("\n".join(lines), reply_markup=menu_kb())
 
 @dp.message(Command("shot"))
@@ -528,11 +578,8 @@ async def cmd_shot(m: Message):
     await m.answer("Готовлю скрин…", reply_markup=menu_kb())
     snap, err = await compute_snapshot(m.from_user.id)
     if err: await m.answer(err, reply_markup=menu_kb()); return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
-    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    src = snap.get("source")
-    if src == "cache": cap += " • цены из кэша"
-    elif src == "binance": cap += " • цены: Binance"
+    path, note = await render_with_ai_control(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0), m.from_user.id)
+    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • {note}"
     await m.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
 # ---- Callbacks ----
@@ -554,14 +601,16 @@ async def cb_set_time(c: CallbackQuery):
     await c.answer()
     await c.message.answer("Укажите время как /time HH:MM (UTC).", reply_markup=menu_kb())
 
+@dp.callback_query(F.data == "refpic_hint")
+async def cb_refpic_hint(c: CallbackQuery):
+    await c.answer()
+    await cmd_refpic(c.message)
+
 async def cb_send_shot(c: CallbackQuery):
     snap, err = await compute_snapshot(c.from_user.id)
     if err: await c.message.answer(err, reply_markup=menu_kb()); return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
-    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    src = snap.get("source")
-    if src == "cache": cap += " • цены из кэша"
-    elif src == "binance": cap += " • цены: Binance"
+    path, note = await render_with_ai_control(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0), c.from_user.id)
+    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • {note}"
     await c.message.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
 async def cb_send_prices(c: CallbackQuery):
@@ -572,37 +621,25 @@ async def cb_send_prices(c: CallbackQuery):
     for r in snap["items"]:
         h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{round(r.get('H24') or 0,2)}%" if r.get("H24") is not None else ""
         lines.append(f"{r['SYMBOL']}: {fmt_amount(r['AMOUNT_F'])} шт • {fmt_price(r['PRICE_F'])} • {fmt_money(r['VALUE_F'])}{h24}")
-    src = snap.get("source")
-    if src == "cache": lines.append("⚠️ Цены из кэша.")
-    elif src == "binance": lines.append("Источник цен: Binance.")
     await c.message.answer("\n".join(lines), reply_markup=menu_kb())
 
 # -------- Lifecycle --------
 PLAYWRIGHT = None
-scheduler = AsyncIOScheduler()
-
 async def on_startup():
     global PLAYWRIGHT
     db_init()
     ensure_playwright_chromium()
     PLAYWRIGHT = await async_playwright().start()
-    if not scheduler.running: scheduler.start()
-
 async def on_shutdown():
     global PLAYWRIGHT
-    if scheduler.running: scheduler.shutdown(wait=False)
     if PLAYWRIGHT: await PLAYWRIGHT.stop()
 
 async def main():
     await on_startup()
     try:
         bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        # На всякий случай снимем старый вебхук (если когда-то включали) —
-        # это помогает от «конфликтов» при переключении webhook → polling.
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
+        try: await bot.delete_webhook(drop_pending_updates=True)
+        except Exception: pass
         await dp.start_polling(bot)
     finally:
         await on_shutdown()

@@ -1,4 +1,7 @@
 from typing import Optional, Tuple
+import subprocess
+from shutil import which
+from pathlib import Path
 import asyncio
 import json
 import os
@@ -33,6 +36,23 @@ DB_PATH = "bot.db"
 CACHE_PATH = Path("prices_cache.json")
 CACHE_TTL_SECONDS = 180  # 3 минуты кэш на случай 429
 # ===============================================
+
+def ensure_playwright_chromium():
+    # Если бинарь уже скачан — ничего не делаем
+    cache_dir = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
+    if cache_dir.exists() and any(cache_dir.rglob("headless_shell")):
+        return
+    # Если playwright не найден, это странно — но попробуем установить заново
+    try:
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "--with-deps", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError as e:
+        # В лог выведем, но работу не прерываем — бот может дальше жить (скрин не получится, но всё остальное да)
+        print("Playwright install failed:", e.stdout.decode("utf-8", errors="ignore"))
 
 # ---------- База данных ----------
 def db_init():
@@ -510,6 +530,13 @@ PLAYWRIGHT = None
 async def on_startup():
     global PLAYWRIGHT
     db_init()
+async def on_startup():
+    global PLAYWRIGHT
+    db_init()
+    ensure_playwright_chromium()   # <--- добавьте эту строку
+    PLAYWRIGHT = await async_playwright().start()
+    if not scheduler.running:
+        scheduler.start()
     PLAYWRIGHT = await async_playwright().start()
     if not scheduler.running:
         scheduler.start()

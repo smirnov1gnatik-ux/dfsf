@@ -1,9 +1,7 @@
-# main.py
-# ------------------------------------------------------------
-# Telegram-бот: Trust Wallet-like screenshot (ZRO/BNB/USDT + fZRO)
-# aiogram 3.7+, Playwright; Binance -> CoinGecko -> cache; 24h change;
-# инлайн-кнопки; плановые отправки; авто-доустановка Chromium (без root).
-# ------------------------------------------------------------
+# main.py — Trust Wallet-style screenshot bot (aiogram 3.7+)
+# Binance→CG→cache, 24h change, проценты от "базы" (/setup),
+# Trust UI (иконки, пилюли сетей, формат чисел как на скрине),
+# инлайн-кнопки, плановые отправки, Playwright auto-install.
 
 import asyncio
 import json
@@ -28,49 +26,57 @@ from aiogram.types import (
 from jinja2 import Template
 from playwright.async_api import async_playwright
 
-# ================== НАСТРОЙКИ ==================
+# ------------ Config ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN.")
+    raise RuntimeError("BOT_TOKEN не задан.")
 
-# Token -> CoinGecko id
 COINGECKO_IDS = {"ZRO": "layerzero", "BNB": "binancecoin", "USDT": "tether"}
 
-# Token -> подпись сети (лейбл под названием монеты)
-CHAIN_LABEL = {
-    "ZRO": "BNB Smart Chain",
-    "BNB": "BNB Smart Chain",
-    "USDT": "BNB Smart Chain",
-}
+# подписи сетей (лейбл под названием монеты)
+CHAIN_LABEL = {"ZRO": "BNB Smart Chain", "BNB": "BNB Smart Chain", "USDT": "BNB Smart Chain"}
 
 DB_PATH = "bot.db"
 CACHE_PATH = Path("prices_cache.json")
-CACHE_TTL_SECONDS = 180  # 3 минуты
+CACHE_TTL_SECONDS = 180
 PLAYWRIGHT_BROWSERS_PATH = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
-# ===============================================
+# ---------------------------------
 
-
-# ---------- Установка Chromium (без root) ----------
 def ensure_playwright_chromium():
-    # Если Chromium уже скачан — ничего не делаем
     try:
         if PLAYWRIGHT_BROWSERS_PATH.exists() and any(PLAYWRIGHT_BROWSERS_PATH.rglob("headless_shell")):
             return
     except Exception:
         pass
-    # Доустановка браузера (без --with-deps, чтобы не требовался root)
     try:
         print("Installing Playwright Chromium…")
         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
     except subprocess.CalledProcessError as e:
-        print("Playwright install failed with code", e.returncode)
+        print("Playwright install failed:", e.returncode)
 
+# -------- Helpers: RU formatting --------
+def fmt_amount(x: float, decimals: int = 4) -> str:
+    # 0.0043 -> "0,0043"; 1040 -> "1040"
+    if float(x).is_integer():
+        s = f"{x:.0f}"
+    else:
+        s = f"{x:.{decimals}f}".rstrip("0").rstrip(".")
+    return s.replace(".", ",")
 
-# ---------- База данных ----------
+def fmt_money(x: float) -> str:
+    # 36.06 -> "36,06 $"
+    s = f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{s} $"
+
+def fmt_price(x: float) -> str:
+    # 2.3 -> "2,3000 $/шт"
+    s = f"{x:,.4f}".replace(",", " ").replace(".", ",")
+    return f"{s} $/шт"
+
+# -------- DB --------
 def db_init():
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""
+        con.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id INTEGER PRIMARY KEY,
             zro REAL DEFAULT 0,
@@ -83,87 +89,56 @@ def db_init():
             created_at TEXT,
             daily_hour INTEGER,
             daily_minute INTEGER
-        )
-        """)
+        )""")
         con.commit()
 
 def get_profile(user_id: int):
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""SELECT user_id,zro,bnb,usdt,fzro,
-                              baseline_zro,baseline_bnb,baseline_usdt,
-                              created_at,daily_hour,daily_minute
-                       FROM profiles WHERE user_id=?""", (user_id,))
+        cur = con.execute("""SELECT user_id,zro,bnb,usdt,fzro,
+                             baseline_zro,baseline_bnb,baseline_usdt,
+                             created_at,daily_hour,daily_minute
+                             FROM profiles WHERE user_id=?""", (user_id,))
         row = cur.fetchone()
-        if not row:
-            return None
+        if not row: return None
         keys = ["user_id","zro","bnb","usdt","fzro","baseline_zro","baseline_bnb","baseline_usdt","created_at","daily_hour","daily_minute"]
         return dict(zip(keys, row))
 
 def upsert_profile(user_id: int, amounts: dict, baselines: dict, schedule_time: Optional[tuple[int,int]]):
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""
+        con.execute("""
         INSERT INTO profiles (user_id,zro,bnb,usdt,fzro,baseline_zro,baseline_bnb,baseline_usdt,created_at,daily_hour,daily_minute)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET
-            zro=excluded.zro,
-            bnb=excluded.bnb,
-            usdt=excluded.usdt,
-            fzro=excluded.fzro,
-            baseline_zro=excluded.baseline_zro,
-            baseline_bnb=excluded.baseline_bnb,
-            baseline_usdt=excluded.baseline_usdt,
-            created_at=excluded.created_at,
-            daily_hour=excluded.daily_hour,
-            daily_minute=excluded.daily_minute
+          zro=excluded.zro,bnb=excluded.bnb,usdt=excluded.usdt,fzro=excluded.fzro,
+          baseline_zro=excluded.baseline_zro,baseline_bnb=excluded.baseline_bnb,baseline_usdt=excluded.baseline_usdt,
+          created_at=excluded.created_at,daily_hour=excluded.daily_hour,daily_minute=excluded.daily_minute
         """, (
-            user_id,
-            float(amounts.get("ZRO",0.0)),
-            float(amounts.get("BNB",0.0)),
-            float(amounts.get("USDT",0.0)),
-            float(amounts.get("fZRO",0.0)),
-            baselines.get("ZRO"),
-            baselines.get("BNB"),
-            baselines.get("USDT"),
+            user_id, float(amounts.get("ZRO",0.0)), float(amounts.get("BNB",0.0)),
+            float(amounts.get("USDT",0.0)), float(amounts.get("fZRO",0.0)),
+            baselines.get("ZRO"), baselines.get("BNB"), baselines.get("USDT"),
             datetime.now(timezone.utc).isoformat(),
-            schedule_time[0] if schedule_time else None,
-            schedule_time[1] if schedule_time else None,
+            schedule_time[0] if schedule_time else None, schedule_time[1] if schedule_time else None
         ))
         con.commit()
 
-
-# ---------- Кэш цен ----------
+# -------- Cache --------
 def _cache_read() -> Optional[dict]:
     if CACHE_PATH.exists():
         try:
             obj = json.loads(CACHE_PATH.read_text())
-            ts = obj.get("ts", 0)
-            if (datetime.now(timezone.utc).timestamp() - ts) <= CACHE_TTL_SECONDS:
+            if (datetime.now(timezone.utc).timestamp() - obj.get("ts", 0)) <= CACHE_TTL_SECONDS:
                 return obj.get("prices")
         except Exception:
             return None
     return None
-
 def _cache_write(prices: dict):
     try:
         CACHE_PATH.write_text(json.dumps({"ts": datetime.now(timezone.utc).timestamp(), "prices": prices}))
-    except Exception:
-        pass
+    except Exception: pass
 
-
-# ---------- Цены: Binance -> CoinGecko -> кэш ----------
+# -------- Prices: Binance → CoinGecko → cache --------
 async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], str]:
-    """
-    Возвращает (prices, source)
-    prices = {
-      "ZRO": {"price": float, "h24": float|None},
-      "BNB": {"price": float, "h24": float|None},
-      "USDT": {"price": 1.0,   "h24": 0.0}
-    }
-    source in {'binance','coingecko','cache'}
-    """
-    # --- A) Binance (основной источник) ---
+    # A) Binance (price + 24h change)
     try:
         async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", timeout=15) as r1, \
                    session.get("https://api.binance.com/api/v3/ticker/price?symbol=ZROUSDT", timeout=15) as r2, \
@@ -174,178 +149,177 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], 
             zro = float((await r2.json())["price"])
             bnb24 = float((await r3.json())["priceChangePercent"])
             zro24 = float((await r4.json())["priceChangePercent"])
-            prices = {
-                "ZRO": {"price": zro, "h24": zro24},
-                "BNB": {"price": bnb, "h24": bnb24},
-                "USDT": {"price": 1.0, "h24": 0.0},
-            }
-            _cache_write({"ZRO": zro, "BNB": bnb, "USDT": 1.0})
+            prices = {"ZRO":{"price":zro,"h24":zro24}, "BNB":{"price":bnb,"h24":bnb24}, "USDT":{"price":1.0,"h24":0.0}}
+            _cache_write({"ZRO":zro,"BNB":bnb,"USDT":1.0})
             return prices, "binance"
     except Exception:
         pass
-
-    # --- B) CoinGecko (резерв) ---
+    # B) CoinGecko (fallback)
     ids = ",".join(COINGECKO_IDS.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-    backoffs = [0.5, 1.2, 2.5, 5.0]
-    for i, delay in enumerate(backoffs):
+    backoffs = [0.5,1.2,2.5,5.0]
+    for i, d in enumerate(backoffs):
         try:
             async with session.get(url, timeout=25) as r:
                 if r.status == 429 or 500 <= r.status < 600:
-                    raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message="rate/5xx", headers=r.headers)
+                    raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message="rate/5xx")
                 r.raise_for_status()
                 data = await r.json()
-                prices = {
-                    "ZRO": {"price": float(data[COINGECKO_IDS["ZRO"]]["usd"]), "h24": None},
-                    "BNB": {"price": float(data[COINGECKO_IDS["BNB"]]["usd"]), "h24": None},
-                    "USDT": {"price": float(data[COINGECKO_IDS["USDT"]]["usd"]), "h24": 0.0},
-                }
-                _cache_write({"ZRO": prices["ZRO"]["price"], "BNB": prices["BNB"]["price"], "USDT": prices["USDT"]["price"]})
+                prices = {"ZRO":{"price":float(data["layerzero"]["usd"]), "h24":None},
+                          "BNB":{"price":float(data["binancecoin"]["usd"]), "h24":None},
+                          "USDT":{"price":float(data["tether"]["usd"]), "h24":0.0}}
+                _cache_write({"ZRO":prices["ZRO"]["price"],"BNB":prices["BNB"]["price"],"USDT":prices["USDT"]["price"]})
                 return prices, "coingecko"
         except aiohttp.ClientResponseError:
-            if i < len(backoffs) - 1:
-                await asyncio.sleep(delay)
-                continue
+            if i < len(backoffs)-1:
+                await asyncio.sleep(d); continue
             cached = _cache_read()
             if cached:
-                return {
-                    "ZRO": {"price": float(cached["ZRO"]), "h24": None},
-                    "BNB": {"price": float(cached["BNB"]), "h24": None},
-                    "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
-                }, "cache"
+                return {"ZRO":{"price":float(cached["ZRO"]),"h24":None},
+                        "BNB":{"price":float(cached["BNB"]),"h24":None},
+                        "USDT":{"price":float(cached["USDT"]),"h24":0.0}}, "cache"
             raise
         except Exception:
             cached = _cache_read()
             if cached:
-                return {
-                    "ZRO": {"price": float(cached["ZRO"]), "h24": None},
-                    "BNB": {"price": float(cached["BNB"]), "h24": None},
-                    "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
-                }, "cache"
+                return {"ZRO":{"price":float(cached["ZRO"]),"h24":None},
+                        "BNB":{"price":float(cached["BNB"]),"h24":None},
+                        "USDT":{"price":float(cached["USDT"]),"h24":0.0}}, "cache"
             raise
-
-    # --- C) вообще ничего не вышло ---
     cached = _cache_read()
     if cached:
-        return {
-            "ZRO": {"price": float(cached["ZRO"]), "h24": None},
-            "BNB": {"price": float(cached["BNB"]), "h24": None},
-            "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
-        }, "cache"
+        return {"ZRO":{"price":float(cached["ZRO"]),"h24":None},
+                "BNB":{"price":float(cached["BNB"]),"h24":None},
+                "USDT":{"price":float(cached["USDT"]),"h24":0.0}}, "cache"
     raise RuntimeError("Нет источника цен")
 
-
-# ---------- Встроенные SVG-иконки ----------
-ICON_BNB = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
-<rect width="28" height="28" rx="6" fill="#F3BA2F"/>
-<path d="M14 5.5l3.7 3.7-1.5 1.5L14 8.5l-2.2 2.2-1.5-1.5L14 5.5zm5.8 5.8l1.5 1.5-1.5 1.5-1.5-1.5 1.5-1.5zM14 11.3l2.7 2.7L14 16.7l-2.7-2.7L14 11.3zm-6.8 0l1.5 1.5-1.5 1.5-1.5-1.5L7.2 11.3zM14 18.5l2.2-2.2 1.5 1.5L14 22.5l-3.7-3.7 1.5-1.5L14 18.5z" fill="#1A1A1A"/>
+# -------- SVG иконки (в т.ч. маленький BSC-бейдж) --------
+ICON_BNB = """<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+<circle cx="18" cy="18" r="18" fill="#0B101A"/>
+<path d="M18 6l4.8 4.8-2 2L18 10l-2.8 2.8-2-2L18 6zm7.5 7.5l2 2-2 2-2-2 2-2zM18 12.5l3.5 3.5L18 19.5l-3.5-3.5L18 12.5zm-7.5 1l2 2-2 2-2-2 2-2zM18 22l2.8-2.8 2 2L18 28l-4.8-4.8 2-2L18 22z" fill="#F3BA2F"/>
 </svg>"""
-
-ICON_USDT = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
-<rect width="28" height="28" rx="6" fill="#26A17B"/>
-<path fill="#fff" d="M7.5 8.5h13v2.2h-4.9v2c1.8.2 3 .6 3 .9 0 .4-2.7.9-6 .9s-6-.5-6-.9c0-.3 1.2-.7 3-.9v-2H7.5V8.5zm5.1 7.1c3.3 0 6-.4 6-.9 0-.3-1.2-.7-3-.9v4.6h-6v-4.6c-1.8.2-3 .6-3 .9 0 .5 2.7.9 6 .9z"/>
+ICON_USDT = """<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+<circle cx="18" cy="18" r="18" fill="#26A17B"/>
+<path fill="#fff" d="M10 12h16v3H19v2.2c2.2.2 3.7.7 3.7 1.1 0 .6-3.4 1.2-7.7 1.2s-7.7-.6-7.7-1.2c0-.4 1.5-.9 3.7-1.1V15H10v-3zm6.3 9.8c4.3 0 7.7-.6 7.7-1.2 0-.4-1.5-.9-3.7-1.1V24h-8v-4.5c-2.2.2-3.7.7-3.7 1.1 0 .6 3.4 1.2 7.7 1.2z"/>
 </svg>"""
-
-ICON_ZRO = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
-<rect width="28" height="28" rx="6" fill="#6C5CE7"/>
-<text x="14" y="18" font-size="12" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-weight="700">ZRO</text>
+ICON_ZRO = """<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+<circle cx="18" cy="18" r="18" fill="#6C5CE7"/>
+<text x="18" y="22" font-size="12" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-weight="700">ZRO</text>
+</svg>"""
+# Маленький бейдж BSC поверх иконки
+BADGE_BSC = """<svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+<circle cx="9" cy="9" r="9" fill="#0B101A"/><path d="M9 2.8l2.1 2.1-0.9.9L9 4.6 7.8 5.8l-0.9-0.9L9 2.8zM12.3 6.1l0.9 0.9-0.9 0.9-0.9-0.9 0.9-0.9zM9 5.6l1.6 1.6L9 8.8 7.4 7.2 9 5.6zM5.7 6.1l0.9 0.9-0.9 0.9-0.9-0.9 0.9-0.9zM9 9.9l1.2-1.2 0.9 0.9L9 12.9 6.9 10.8l0.9-0.9L9 9.9z" fill="#F3BA2F"/>
 </svg>"""
 
 def icon_for(symbol:str) -> str:
-    if symbol.upper() == "BNB":
-        return ICON_BNB
-    if symbol.upper() == "USDT":
-        return ICON_USDT
-    return ICON_ZRO  # ZRO и fZRO (рисуем как ZRO)
+    if symbol.upper() == "BNB": return ICON_BNB
+    if symbol.upper() == "USDT": return ICON_USDT
+    return ICON_ZRO  # ZRO и fZRO рисуем одинаково
 
-
-# ---------- HTML-шаблон Trust Wallet ----------
+# -------- Trust Wallet-like HTML --------
 WALLET_TEMPLATE = """
 <!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trust-like</title>
 <style>
-  :root{--muted:#6b7280;--green:#16a34a;--red:#dc2626}
+  :root{--muted:#6b7280;--green:#16a34a;--red:#dc2626;--pill:#EEF0F4}
   *{box-sizing:border-box}
   body{margin:0;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Ubuntu,Cantarell,Arial}
   .screen{width:390px;margin:0 auto;background:#fff}
-  .topbar{display:flex;align-items:center;justify-content:center;height:44px;padding:0 12px;font-size:15px;color:#111}
-  .balance{padding:6px 16px 10px}
-  .bal-row{display:flex;align-items:flex-end;gap:8px}
-  .bal-value{font-size:36px;font-weight:800;letter-spacing:.3px}
-  .pct{font-size:13px;font-weight:700;margin-left:6px}
-  .pct.up{color:var(--green)} .pct.down{color:var(--red)}
-  .tabs{display:flex;gap:10px;padding:8px 16px 12px}
-  .tab{padding:10px 14px;border-radius:12px;background:#f2f6ff;color:#1f4cff;font-weight:700;font-size:13px}
-  .list{padding:6px 10px 16px}
+  .top{display:flex;align-items:center;justify-content:center;height:44px;padding:0 12px;font-size:15px}
+  .balance{padding:10px 16px}
+  .bal-num{font-size:40px;font-weight:800;letter-spacing:.3px}
+  .bal-delta{color:var(--green);font-weight:700;margin-top:4px}
+  .actions{display:flex;justify-content:space-between;padding:8px 16px 12px}
+  .act{width:78px;height:78px;border-radius:20px;background:#F1F3F7;display:flex;align-items:center;justify-content:center;font-weight:700}
+  .tabs{display:flex;gap:18px;padding:6px 16px 0;font-weight:800}
+  .tabs .on{color:#1f4cff}
+  .list{padding:8px 10px 16px}
   .row{display:flex;align-items:center;justify-content:space-between;padding:12px 8px;border-bottom:1px solid #f0f0f0}
   .left{display:flex;align-items:center;gap:10px}
-  .icon{width:28px;height:28px;border-radius:8px;overflow:hidden;display:grid;place-items:center}
-  .name{font-weight:700}
-  .chain{font-size:12px;color:var(--muted);margin-top:2px}
+  .icon-wrap{position:relative;width:36px;height:36px}
+  .badge{position:absolute;left:-6px;bottom:-4px}
+  .name{font-weight:800}
+  .pill{display:inline-block;background:var(--pill);color:#3b3b3b;padding:4px 10px;border-radius:999px;font-size:12px;margin-top:4px}
   .right{text-align:right}
-  .usd{font-weight:700}
-  .amt{font-size:12px;color:var(--muted)}
-  .h24{font-size:12px;margin-left:6px}
+  .usd{font-weight:800}
+  .sub{font-size:13px;color:var(--muted);margin-top:2px}
   .h24.up{color:var(--green)} .h24.down{color:var(--red)}
+  .manage{padding:18px 16px;color:#0a58ff;font-weight:800}
+  .navbar{height:70px;border-top:1px solid #eee}
 </style>
 </head><body>
 <div class="screen">
-  <div class="topbar">Основной кошелёк ▾</div>
+  <div class="top">Основной кошелёк ▾</div>
   <div class="balance">
-    <div class="bal-row">
-      <div class="bal-value">$ {{TOTAL_USD}}</div>
-      <div class="pct {{'up' if TOTAL_PCT>=0 else 'down'}}">{{'+' if TOTAL_PCT>=0 else ''}}{{TOTAL_PCT}}%</div>
-    </div>
+    <div class="bal-num">{{BALANCE}}</div>
+    <div class="bal-delta">↑ {{BALANCE_DELTA}}</div>
+  </div>
+  <div class="actions">
+    <div class="act">Отправить</div>
+    <div class="act">Обмен</div>
+    <div class="act" style="background:#1f4cff;color:#fff">Фонд</div>
+    <div class="act">Продажа</div>
   </div>
   <div class="tabs">
-    <div class="tab">Фонд</div>
+    <div class="on">Криптовалюта</div><div class="off" style="color:#9aa3ad">NFT</div>
   </div>
 
   <div class="list">
   {% for item in ITEMS %}
     <div class="row">
       <div class="left">
-        <div class="icon">{{item.ICON|safe}}</div>
+        <div class="icon-wrap">
+          <div class="icon">{{item.ICON|safe}}</div>
+          <div class="badge">{{item.BADGE|safe}}</div>
+        </div>
         <div>
           <div class="name">{{item.SYMBOL}}</div>
-          <div class="chain">{{item.CHAIN}}</div>
+          <div class="pill">{{item.CHAIN}}</div>
         </div>
       </div>
       <div class="right">
-        <div class="usd">${{item.VALUE}}</div>
-        <div class="amt">{{item.AMOUNT}} • ${{item.PRICE}}/шт
+        <div class="usd">{{item.VALUE}} $</div>
+        <div class="sub">{{item.PRICE}}
           {% if item.H24 is not none %}
-          <span class="h24 {{'up' if item.H24>=0 else 'down'}}">{{'+' if item.H24>=0 else ''}}{{item.H24}}% 24ч</span>
+          <span class="h24 {{'up' if item.H24>=0 else 'down'}}">{{'+' if item.H24>=0 else ''}}{{item.H24}}%</span>
           {% endif %}
         </div>
       </div>
     </div>
   {% endfor %}
   </div>
+
+  <div class="manage">Управлять криптовалютами</div>
+  <div class="navbar"></div>
 </div>
 </body></html>
 """
 
-async def render_wallet_screenshot(playwright, items:list, total_usd:str, total_pct:float=0.0) -> str:
-    # items: [{SYMBOL, AMOUNT, PRICE, VALUE, CHANGE_PCT, H24}]
+# -------- Render --------
+async def render_wallet_screenshot(playwright, items:list, total_usd:float, total_pct:float=0.0) -> str:
+    # items: [{SYMBOL, AMOUNT_F, PRICE_F, VALUE_F, H24}]
+    # Соберём итоговые строки с нужным форматированием
     mapped = []
     for it in items:
         mapped.append({
             "ICON": icon_for(it["SYMBOL"]),
+            "BADGE": BADGE_BSC,
             "SYMBOL": it["SYMBOL"],
             "CHAIN": CHAIN_LABEL.get(it["SYMBOL"], "BNB Smart Chain"),
-            "AMOUNT": it["AMOUNT"],
-            "PRICE": it["PRICE"],
-            "VALUE": it["VALUE"],
-            "H24": it.get("H24"),
-            "CHANGE_PCT": it["CHANGE_PCT"],
+            "VALUE": fmt_money(it["VALUE_F"]).replace(" $",""),  # в шаблоне добавляем " $"
+            "PRICE": fmt_price(it["PRICE_F"]),
+            "H24": None if it.get("H24") is None else round(float(it["H24"]), 2),
         })
 
+    # шапка баланса как на скрине: число + стрелка, показываем текущий портфель и его % от базы
+    balance_text = fmt_money(total_usd)
+    delta_text = f"{fmt_money(total_usd * abs(total_pct)/100)} (+{total_pct}% от базы)" if total_pct >= 0 else f"{fmt_money(total_usd * abs(total_pct)/100)} ({total_pct}% от базы)"
+
     html = Template(WALLET_TEMPLATE).render(
-        TOTAL_USD=total_usd,
-        TOTAL_PCT=total_pct,
+        BALANCE=balance_text.replace(" $"," $"),
+        BALANCE_DELTA=delta_text.replace(" $"," $"),
         ITEMS=mapped
     )
 
@@ -354,7 +328,6 @@ async def render_wallet_screenshot(playwright, items:list, total_usd:str, total_
         f.write(html)
 
     browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-    # iPhone-ish
     ctx = await browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2)
     page = await ctx.new_page()
     await page.goto("file://" + os.path.abspath(path_html))
@@ -366,8 +339,7 @@ async def render_wallet_screenshot(playwright, items:list, total_usd:str, total_
     await browser.close()
     return out
 
-
-# ---------- Бизнес-логика ----------
+# -------- Business logic --------
 def parse_setup(body: str):
     """
     Пример:
@@ -429,60 +401,48 @@ async def compute_snapshot(user_id:int):
         ("USDT", prof["usdt"], pusdt, pct(pusdt, busdt), usdt24),
         ("ZRO", prof["fzro"], pzro, pct(pzro, bzro), zro24),
     ]
-    total = 0.0
+    total_val = 0.0
     weighted_parts = []
+    items_for_render = []
     for sym, amount, price, change, h24 in entries:
         value_f = amount * price
-        value = round(value_f, 2)
-        total += value
+        total_val += value_f
         weighted_parts.append((value_f, change))
-        rows.append({
+        items_for_render.append({
             "SYMBOL": sym,
-            "AMOUNT": f"{amount:g}",
-            "PRICE": f"{price:,.4f}".replace(",", " "),
-            "VALUE": f"{value:,.2f}".replace(",", " "),
+            "AMOUNT_F": amount,
+            "PRICE_F": price,
+            "VALUE_F": round(value_f, 2),
             "CHANGE_PCT": change,
-            "H24": None if h24 is None else round(float(h24), 2)
+            "H24": h24
         })
 
-    total_str = f"{total:,.2f}".replace(",", " ")
-    # Взвешенный портфельный % относительно "базы"
     total_pct = 0.0
-    if total > 0:
-        total_pct = round(sum(v/total * c for v, c in weighted_parts), 2)
+    if total_val > 0:
+        total_pct = round(sum(v/total_val * c for v, c in weighted_parts), 2)
 
-    return {"rows": rows, "total": total_str, "total_pct": total_pct, "source": source}, None
+    return {"items": items_for_render, "total_usd": total_val, "total_pct": total_pct, "source": source}, None
 
-
-# ---------- Планировщик ----------
+# -------- Scheduler --------
 scheduler = AsyncIOScheduler()
-
 def schedule_user_job(user_id:int, hour:int, minute:int, bot: Bot, playwright):
     job_id = f"user-{user_id}"
     old = scheduler.get_job(job_id)
-    if old:
-        old.remove()
-
+    if old: old.remove()
     trigger = CronTrigger(hour=hour, minute=minute, timezone="UTC")
-
     async def job():
         snap, err = await compute_snapshot(user_id)
         if err:
-            await bot.send_message(user_id, err, reply_markup=menu_kb())
-            return
-        path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
+            await bot.send_message(user_id, err, reply_markup=menu_kb()); return
+        path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
         cap = f"Плановый снимок {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         src = snap.get("source")
-        if src == "cache":
-            cap += " • цены из кэша"
-        elif src == "binance":
-            cap += " • цены: Binance"
+        if src == "cache": cap += " • цены из кэша"
+        elif src == "binance": cap += " • цены: Binance"
         await bot.send_photo(user_id, FSInputFile(path), caption=cap, reply_markup=menu_kb())
-
     scheduler.add_job(job, trigger, id=job_id)
 
-
-# ---------- Кнопки ----------
+# -------- Buttons --------
 def menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Скрин сейчас", callback_data="shot_now")],
@@ -493,20 +453,15 @@ def menu_kb():
         ],
     ])
 
-
-# ---------- Бот ----------
+# -------- Bot --------
 dp = Dispatcher()
-PLAYWRIGHT = None  # глобальный инстанс Playwright
+PLAYWRIGHT = None
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     await m.answer(
-        "Привет! Я делаю скриншоты кошелька с ценами ZRO/BNB/USDT и fZRO в стиле Trust Wallet.\n"
-        "Используйте кнопки ниже или команды:\n"
-        "• /setup — задать количества и (опц.) время\n"
-        "• /shot — скрин сейчас\n"
-        "• /prices — текстовые цены\n"
-        "• /time HH:MM — ежедневный скрин по UTC\n",
+        "Привет! Делаю скрины кошелька в стиле Trust Wallet (ZRO/BNB/USDT и fZRO).\n"
+        "Кнопки снизу помогут настроить.",
         reply_markup=menu_kb()
     )
 
@@ -515,182 +470,139 @@ async def cmd_setup(m: Message):
     parts = m.text.split("\n", 1)
     body = parts[1] if len(parts) > 1 else ""
     if not body.strip():
-        await m.answer(
-            "Отправьте /setup и в теле укажите построчно значения.\nПример:\n\n"
-            "ZRO 750.034\nBNB 0.01\nUSDT 0\nfZRO 1040\nat 18:30",
-            reply_markup=menu_kb()
-        )
-        return
-
+        await m.answer("Отправьте /setup и в теле значения.\nПример:\n\n"
+                       "ZRO 750.034\nBNB 0.01\nUSDT 0\nfZRO 1040\nat 18:30",
+                       reply_markup=menu_kb()); return
     amounts, sched = parse_setup(body)
     try:
         async with aiohttp.ClientSession() as sess:
             prices, source = await fetch_prices(sess)
     except Exception:
-        await m.answer("Не удалось получить цены. Попробуйте ещё раз /setup.", reply_markup=menu_kb())
-        return
-
+        await m.answer("Не удалось получить цены. Попробуйте ещё раз /setup.", reply_markup=menu_kb()); return
     baselines = {k: prices[k]["price"] for k in ("ZRO","BNB","USDT")}
     upsert_profile(m.from_user.id, amounts, baselines, sched)
-
-    if sched:
-        schedule_user_job(m.from_user.id, sched[0], sched[1], m.bot, PLAYWRIGHT)
-
-    msg = (
-        "Сохранено ✅\n"
-        f"ZRO: {amounts['ZRO']}\n"
-        f"BNB: {amounts['BNB']}\n"
-        f"USDT: {amounts['USDT']}\n"
-        f"fZRO: {amounts['fZRO']}\n"
-        f"Базовые цены (USD): ZRO={baselines['ZRO']:.4f}, BNB={baselines['BNB']:.4f}, USDT={baselines['USDT']:.4f}\n"
-        f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='coingecko' else 'кэш')}\n"
-    )
-    msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC." if sched else "Плановая отправка не задана (можно /time HH:MM)."
+    if sched: schedule_user_job(m.from_user.id, sched[0], sched[1], m.bot, PLAYWRIGHT)
+    msg = ("Сохранено ✅\n"
+           f"ZRO: {amounts['ZRO']}\nBNB: {amounts['BNB']}\nUSDT: {amounts['USDT']}\n"
+           f"fZRO: {amounts['fZRO']}\n"
+           f"Базовые цены (USD): ZRO={prices['ZRO']['price']:.4f}, BNB={prices['BNB']['price']:.4f}, USDT={prices['USDT']['price']:.4f}\n"
+           f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='coingecko' else 'кэш')}\n")
+    msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC." if sched else "Плановая отправка не задана."
     await m.answer(msg, reply_markup=menu_kb())
 
 @dp.message(Command("time"))
 async def cmd_time(m: Message):
     parts = m.text.strip().split()
     if len(parts) != 2 or ":" not in parts[1]:
-        await m.answer("Укажите время как HH:MM (UTC). Например: /time 18:30", reply_markup=menu_kb())
-        return
+        await m.answer("Укажите время как /time HH:MM (UTC).", reply_markup=menu_kb()); return
     try:
-        hh, mm = parts[1].split(":")
-        hour, minute = int(hh), int(mm)
+        hh, mm = parts[1].split(":"); hour, minute = int(hh), int(mm)
     except Exception:
-        await m.answer("Неверный формат времени.", reply_markup=menu_kb())
-        return
-
+        await m.answer("Неверный формат времени.", reply_markup=menu_kb()); return
     prof = get_profile(m.from_user.id)
     if not prof:
-        await m.answer("Сначала выполните /setup с вашими количествами токенов.", reply_markup=menu_kb())
-        return
-
-    upsert_profile(
-        m.from_user.id,
+        await m.answer("Сначала выполните /setup.", reply_markup=menu_kb()); return
+    upsert_profile(m.from_user.id,
         {"ZRO": prof["zro"], "BNB": prof["bnb"], "USDT": prof["usdt"], "fZRO": prof["fzro"]},
         {"ZRO": prof["baseline_zro"], "BNB": prof["baseline_bnb"], "USDT": prof["baseline_usdt"]},
-        (hour, minute)
-    )
+        (hour, minute))
     schedule_user_job(m.from_user.id, hour, minute, m.bot, PLAYWRIGHT)
-    await m.answer(f"Ок! Ежедневно в {hour:02d}:{minute:02d} UTC буду присылать скрин.", reply_markup=menu_kb())
+    await m.answer(f"Ок! Ежедневно в {hour:02d}:{minute:02d} UTC.", reply_markup=menu_kb())
 
 @dp.message(Command("prices"))
 async def cmd_prices(m: Message):
     snap, err = await compute_snapshot(m.from_user.id)
-    if err:
-        await m.answer(err, reply_markup=menu_kb())
-        return
-    lines = [f"Итоговая оценка: ${snap['total']}  ({'+' if snap.get('total_pct',0)>=0 else ''}{snap.get('total_pct',0)}% от базы)"]
-    for r in snap["rows"]:
-        sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
-        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{r.get('H24')}%" if r.get("H24") is not None else ""
-        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}% от базы{h24}")
+    if err: await m.answer(err, reply_markup=menu_kb()); return
+    total = fmt_money(snap['total_usd'])
+    lines = [f"Итог: {total}  ({'+' if snap['total_pct']>=0 else ''}{snap['total_pct']}% от базы)"]
+    for r in snap["items"]:
+        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{round(r.get('H24') or 0,2)}%" if r.get("H24") is not None else ""
+        lines.append(f"{r['SYMBOL']}: {fmt_amount(r['AMOUNT_F'])} шт • {fmt_price(r['PRICE_F'])} • {fmt_money(r['VALUE_F'])}{h24}")
     src = snap.get("source")
-    if src == "cache":
-        lines.append("⚠️ Цены взяты из кэша.")
-    elif src == "binance":
-        lines.append("Источник цен: Binance.")
+    if src == "cache": lines.append("⚠️ Цены из кэша.")
+    elif src == "binance": lines.append("Источник цен: Binance.")
     await m.answer("\n".join(lines), reply_markup=menu_kb())
 
 @dp.message(Command("shot"))
 async def cmd_shot(m: Message):
     await m.answer("Готовлю скрин…", reply_markup=menu_kb())
     snap, err = await compute_snapshot(m.from_user.id)
-    if err:
-        await m.answer(err, reply_markup=menu_kb())
-        return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
+    if err: await m.answer(err, reply_markup=menu_kb()); return
+    path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
     cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     src = snap.get("source")
-    if src == "cache":
-        cap += " • цены из кэша"
-    elif src == "binance":
-        cap += " • цены: Binance"
+    if src == "cache": cap += " • цены из кэша"
+    elif src == "binance": cap += " • цены: Binance"
     await m.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
-# ---------- Обработчики кнопок ----------
+# ---- Callbacks ----
 @dp.callback_query(F.data == "shot_now")
 async def cb_shot_now(c: CallbackQuery):
-    await c.answer()
-    await cb_send_shot(c)
+    await c.answer(); await cb_send_shot(c)
 
 @dp.callback_query(F.data == "prices_now")
 async def cb_prices_now(c: CallbackQuery):
-    await c.answer()
-    await cb_send_prices(c)
+    await c.answer(); await cb_send_prices(c)
 
 @dp.callback_query(F.data == "send_setup_template")
 async def cb_send_setup_template(c: CallbackQuery):
     await c.answer()
-    txt = ("Отправьте одно сообщение формата:\n\n"
-           "/setup\n"
-           "ZRO 750.034\n"
-           "BNB 0.01\n"
-           "USDT 0\n"
-           "fZRO 1040\n"
-           "at 18:30")
-    await c.message.answer(txt, reply_markup=menu_kb())
+    await c.message.answer("Отправьте:\n\n/ setup\nZRO 750.034\nBNB 0.01\nUSDT 0\nfZRO 1040\nat 18:30", reply_markup=menu_kb())
 
 @dp.callback_query(F.data == "set_time_utc")
 async def cb_set_time(c: CallbackQuery):
     await c.answer()
-    await c.message.answer("Укажите время ежедневной отправки как /time HH:MM (UTC). Например: /time 18:30", reply_markup=menu_kb())
+    await c.message.answer("Укажите время как /time HH:MM (UTC).", reply_markup=menu_kb())
 
 async def cb_send_shot(c: CallbackQuery):
     snap, err = await compute_snapshot(c.from_user.id)
-    if err:
-        await c.message.answer(err, reply_markup=menu_kb())
-        return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
+    if err: await c.message.answer(err, reply_markup=menu_kb()); return
+    path = await render_wallet_screenshot(PLAYWRIGHT, snap["items"], snap["total_usd"], snap.get("total_pct",0.0))
     cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     src = snap.get("source")
-    if src == "cache":
-        cap += " • цены из кэша"
-    elif src == "binance":
-        cap += " • цены: Binance"
+    if src == "cache": cap += " • цены из кэша"
+    elif src == "binance": cap += " • цены: Binance"
     await c.message.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
 async def cb_send_prices(c: CallbackQuery):
     snap, err = await compute_snapshot(c.from_user.id)
-    if err:
-        await c.message.answer(err, reply_markup=menu_kb())
-        return
-    lines = [f"Итоговая оценка: ${snap['total']}  ({'+' if snap.get('total_pct',0)>=0 else ''}{snap.get('total_pct',0)}% от базы)"]
-    for r in snap["rows"]:
-        sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
-        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{r.get('H24')}%" if r.get("H24") is not None else ""
-        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}% от базы{h24}")
+    if err: await c.message.answer(err, reply_markup=menu_kb()); return
+    total = fmt_money(snap['total_usd'])
+    lines = [f"Итог: {total}  ({'+' if snap['total_pct']>=0 else ''}{snap['total_pct']}% от базы)"]
+    for r in snap["items"]:
+        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{round(r.get('H24') or 0,2)}%" if r.get("H24") is not None else ""
+        lines.append(f"{r['SYMBOL']}: {fmt_amount(r['AMOUNT_F'])} шт • {fmt_price(r['PRICE_F'])} • {fmt_money(r['VALUE_F'])}{h24}")
     src = snap.get("source")
-    if src == "cache":
-        lines.append("⚠️ Цены взяты из кэша.")
-    elif src == "binance":
-        lines.append("Источник цен: Binance.")
+    if src == "cache": lines.append("⚠️ Цены из кэша.")
+    elif src == "binance": lines.append("Источник цен: Binance.")
     await c.message.answer("\n".join(lines), reply_markup=menu_kb())
 
-
-# ---------- Жизненный цикл ----------
+# -------- Lifecycle --------
 PLAYWRIGHT = None
+scheduler = AsyncIOScheduler()
 
 async def on_startup():
     global PLAYWRIGHT
     db_init()
     ensure_playwright_chromium()
     PLAYWRIGHT = await async_playwright().start()
-    if not scheduler.running:
-        scheduler.start()
+    if not scheduler.running: scheduler.start()
 
 async def on_shutdown():
     global PLAYWRIGHT
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-    if PLAYWRIGHT:
-        await PLAYWRIGHT.stop()
+    if scheduler.running: scheduler.shutdown(wait=False)
+    if PLAYWRIGHT: await PLAYWRIGHT.stop()
 
 async def main():
     await on_startup()
     try:
         bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        # На всякий случай снимем старый вебхук (если когда-то включали) —
+        # это помогает от «конфликтов» при переключении webhook → polling.
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         await dp.start_polling(bot)
     finally:
         await on_shutdown()

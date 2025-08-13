@@ -1,9 +1,8 @@
 # main.py
 # ------------------------------------------------------------
-# Telegram-бот: скриншот "Trust-like Wallet" (ZRO/BNB/USDT + fZRO)
-# Кнопки, учёт количеств, проценты от базовой цены, плановые отправки.
-# Источники цен: Binance (приоритет) -> CoinGecko -> локальный кэш.
-# Работает с aiogram 3.7+, Playwright с авто-доустановкой Chromium.
+# Telegram-бот: Trust Wallet-like screenshot (ZRO/BNB/USDT + fZRO)
+# aiogram 3.7+, Playwright; Binance -> CoinGecko -> cache; 24h change;
+# инлайн-кнопки; плановые отправки; авто-доустановка Chromium (без root).
 # ------------------------------------------------------------
 
 import asyncio
@@ -13,7 +12,7 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -34,7 +33,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN.")
 
+# Token -> CoinGecko id
 COINGECKO_IDS = {"ZRO": "layerzero", "BNB": "binancecoin", "USDT": "tether"}
+
+# Token -> подпись сети (лейбл под названием монеты)
+CHAIN_LABEL = {
+    "ZRO": "BNB Smart Chain",
+    "BNB": "BNB Smart Chain",
+    "USDT": "BNB Smart Chain",
+}
 
 DB_PATH = "bot.db"
 CACHE_PATH = Path("prices_cache.json")
@@ -146,24 +153,38 @@ def _cache_write(prices: dict):
 
 
 # ---------- Цены: Binance -> CoinGecko -> кэш ----------
-async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
+async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[Dict[str, Any], str]:
     """
-    Возвращает (prices, source): source in {'binance','coingecko','cache'}
+    Возвращает (prices, source)
+    prices = {
+      "ZRO": {"price": float, "h24": float|None},
+      "BNB": {"price": float, "h24": float|None},
+      "USDT": {"price": 1.0,   "h24": 0.0}
+    }
+    source in {'binance','coingecko','cache'}
     """
-    # --- A) Binance ---
+    # --- A) Binance (основной источник) ---
     try:
         async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", timeout=15) as r1, \
-                   session.get("https://api.binance.com/api/v3/ticker/price?symbol=ZROUSDT", timeout=15) as r2:
-            r1.raise_for_status(); r2.raise_for_status()
+                   session.get("https://api.binance.com/api/v3/ticker/price?symbol=ZROUSDT", timeout=15) as r2, \
+                   session.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT", timeout=15) as r3, \
+                   session.get("https://api.binance.com/api/v3/ticker/24hr?symbol=ZROUSDT", timeout=15) as r4:
+            r1.raise_for_status(); r2.raise_for_status(); r3.raise_for_status(); r4.raise_for_status()
             bnb = float((await r1.json())["price"])
             zro = float((await r2.json())["price"])
-            prices = {"ZRO": zro, "BNB": bnb, "USDT": 1.0}
-            _cache_write(prices)
+            bnb24 = float((await r3.json())["priceChangePercent"])
+            zro24 = float((await r4.json())["priceChangePercent"])
+            prices = {
+                "ZRO": {"price": zro, "h24": zro24},
+                "BNB": {"price": bnb, "h24": bnb24},
+                "USDT": {"price": 1.0, "h24": 0.0},
+            }
+            _cache_write({"ZRO": zro, "BNB": bnb, "USDT": 1.0})
             return prices, "binance"
     except Exception:
         pass
 
-    # --- B) CoinGecko с ретраями ---
+    # --- B) CoinGecko (резерв) ---
     ids = ",".join(COINGECKO_IDS.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
     backoffs = [0.5, 1.2, 2.5, 5.0]
@@ -175,11 +196,11 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
                 r.raise_for_status()
                 data = await r.json()
                 prices = {
-                    "ZRO": float(data[COINGECKO_IDS["ZRO"]]["usd"]),
-                    "BNB": float(data[COINGECKO_IDS["BNB"]]["usd"]),
-                    "USDT": float(data[COINGECKO_IDS["USDT"]]["usd"]),
+                    "ZRO": {"price": float(data[COINGECKO_IDS["ZRO"]]["usd"]), "h24": None},
+                    "BNB": {"price": float(data[COINGECKO_IDS["BNB"]]["usd"]), "h24": None},
+                    "USDT": {"price": float(data[COINGECKO_IDS["USDT"]]["usd"]), "h24": 0.0},
                 }
-                _cache_write(prices)
+                _cache_write({"ZRO": prices["ZRO"]["price"], "BNB": prices["BNB"]["price"], "USDT": prices["USDT"]["price"]})
                 return prices, "coingecko"
         except aiohttp.ClientResponseError:
             if i < len(backoffs) - 1:
@@ -187,86 +208,158 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
                 continue
             cached = _cache_read()
             if cached:
-                return cached, "cache"
+                return {
+                    "ZRO": {"price": float(cached["ZRO"]), "h24": None},
+                    "BNB": {"price": float(cached["BNB"]), "h24": None},
+                    "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
+                }, "cache"
             raise
         except Exception:
             cached = _cache_read()
             if cached:
-                return cached, "cache"
+                return {
+                    "ZRO": {"price": float(cached["ZRO"]), "h24": None},
+                    "BNB": {"price": float(cached["BNB"]), "h24": None},
+                    "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
+                }, "cache"
             raise
 
     # --- C) вообще ничего не вышло ---
     cached = _cache_read()
     if cached:
-        return cached, "cache"
+        return {
+            "ZRO": {"price": float(cached["ZRO"]), "h24": None},
+            "BNB": {"price": float(cached["BNB"]), "h24": None},
+            "USDT": {"price": float(cached["USDT"]), "h24": 0.0},
+        }, "cache"
     raise RuntimeError("Нет источника цен")
 
 
-# ---------- HTML-шаблон скриншота ----------
+# ---------- Встроенные SVG-иконки ----------
+ICON_BNB = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+<rect width="28" height="28" rx="6" fill="#F3BA2F"/>
+<path d="M14 5.5l3.7 3.7-1.5 1.5L14 8.5l-2.2 2.2-1.5-1.5L14 5.5zm5.8 5.8l1.5 1.5-1.5 1.5-1.5-1.5 1.5-1.5zM14 11.3l2.7 2.7L14 16.7l-2.7-2.7L14 11.3zm-6.8 0l1.5 1.5-1.5 1.5-1.5-1.5L7.2 11.3zM14 18.5l2.2-2.2 1.5 1.5L14 22.5l-3.7-3.7 1.5-1.5L14 18.5z" fill="#1A1A1A"/>
+</svg>"""
+
+ICON_USDT = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+<rect width="28" height="28" rx="6" fill="#26A17B"/>
+<path fill="#fff" d="M7.5 8.5h13v2.2h-4.9v2c1.8.2 3 .6 3 .9 0 .4-2.7.9-6 .9s-6-.5-6-.9c0-.3 1.2-.7 3-.9v-2H7.5V8.5zm5.1 7.1c3.3 0 6-.4 6-.9 0-.3-1.2-.7-3-.9v4.6h-6v-4.6c-1.8.2-3 .6-3 .9 0 .5 2.7.9 6 .9z"/>
+</svg>"""
+
+ICON_ZRO = """<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+<rect width="28" height="28" rx="6" fill="#6C5CE7"/>
+<text x="14" y="18" font-size="12" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-weight="700">ZRO</text>
+</svg>"""
+
+def icon_for(symbol:str) -> str:
+    if symbol.upper() == "BNB":
+        return ICON_BNB
+    if symbol.upper() == "USDT":
+        return ICON_USDT
+    return ICON_ZRO  # ZRO и fZRO (рисуем как ZRO)
+
+
+# ---------- HTML-шаблон Trust Wallet ----------
 WALLET_TEMPLATE = """
 <!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Wallet</title>
+<title>Trust-like</title>
 <style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial;margin:0;background:#0f1320;color:#fff}
-  .wrap{max-width:420px;margin:0 auto;padding:16px}
-  .card{background:#171c2f;border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.35)}
-  .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-  .title{font-weight:700;font-size:18px}
-  .time{opacity:.7;font-size:12px}
-  .total{font-size:28px;font-weight:700;margin:10px 0 16px}
-  .row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
-  .row:last-child{border-bottom:none}
-  .sym{font-weight:700}
-  .sub{font-size:12px;opacity:.7}
-  .chg.up{color:#6ee787}.chg.down{color:#ff6b6b}
-  .note{font-size:11px;opacity:.6;margin-top:10px}
+  :root{--muted:#6b7280;--green:#16a34a;--red:#dc2626}
+  *{box-sizing:border-box}
+  body{margin:0;background:#fff;color:#111;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Ubuntu,Cantarell,Arial}
+  .screen{width:390px;margin:0 auto;background:#fff}
+  .topbar{display:flex;align-items:center;justify-content:center;height:44px;padding:0 12px;font-size:15px;color:#111}
+  .balance{padding:6px 16px 10px}
+  .bal-row{display:flex;align-items:flex-end;gap:8px}
+  .bal-value{font-size:36px;font-weight:800;letter-spacing:.3px}
+  .pct{font-size:13px;font-weight:700;margin-left:6px}
+  .pct.up{color:var(--green)} .pct.down{color:var(--red)}
+  .tabs{display:flex;gap:10px;padding:8px 16px 12px}
+  .tab{padding:10px 14px;border-radius:12px;background:#f2f6ff;color:#1f4cff;font-weight:700;font-size:13px}
+  .list{padding:6px 10px 16px}
+  .row{display:flex;align-items:center;justify-content:space-between;padding:12px 8px;border-bottom:1px solid #f0f0f0}
+  .left{display:flex;align-items:center;gap:10px}
+  .icon{width:28px;height:28px;border-radius:8px;overflow:hidden;display:grid;place-items:center}
+  .name{font-weight:700}
+  .chain{font-size:12px;color:var(--muted);margin-top:2px}
+  .right{text-align:right}
+  .usd{font-weight:700}
+  .amt{font-size:12px;color:var(--muted)}
+  .h24{font-size:12px;margin-left:6px}
+  .h24.up{color:var(--green)} .h24.down{color:var(--red)}
 </style>
 </head><body>
-<div class="wrap">
-  <div class="card">
-    <div class="hdr">
-      <div class="title">Trust-like Wallet</div>
-      <div class="time">{{NOW}}</div>
+<div class="screen">
+  <div class="topbar">Основной кошелёк ▾</div>
+  <div class="balance">
+    <div class="bal-row">
+      <div class="bal-value">$ {{TOTAL_USD}}</div>
+      <div class="pct {{'up' if TOTAL_PCT>=0 else 'down'}}">{{'+' if TOTAL_PCT>=0 else ''}}{{TOTAL_PCT}}%</div>
     </div>
-    <div class="total">$ {{TOTAL_USD}}</div>
-    {% for item in ITEMS %}
+  </div>
+  <div class="tabs">
+    <div class="tab">Фонд</div>
+  </div>
+
+  <div class="list">
+  {% for item in ITEMS %}
     <div class="row">
-      <div>
-        <div class="sym">{{item.SYMBOL}}</div>
-        <div class="sub">{{item.AMOUNT}} • ${{item.PRICE}}/шт</div>
+      <div class="left">
+        <div class="icon">{{item.ICON|safe}}</div>
+        <div>
+          <div class="name">{{item.SYMBOL}}</div>
+          <div class="chain">{{item.CHAIN}}</div>
+        </div>
       </div>
-      <div style="text-align:right">
-        <div>${{item.VALUE}}</div>
-        <div class="sub chg {{'up' if item.CHANGE_PCT >= 0 else 'down'}}">
-          {{'+' if item.CHANGE_PCT >= 0 else ''}}{{item.CHANGE_PCT}}%
+      <div class="right">
+        <div class="usd">${{item.VALUE}}</div>
+        <div class="amt">{{item.AMOUNT}} • ${{item.PRICE}}/шт
+          {% if item.H24 is not none %}
+          <span class="h24 {{'up' if item.H24>=0 else 'down'}}">{{'+' if item.H24>=0 else ''}}{{item.H24}}% 24ч</span>
+          {% endif %}
         </div>
       </div>
     </div>
-    {% endfor %}
-    <div class="note">* ZRO показан дважды: реальный и пустышка (fZRO). В интерфейсе оба названы ZRO, учёт раздельный.</div>
+  {% endfor %}
   </div>
 </div>
 </body></html>
 """
 
-async def render_wallet_screenshot(playwright, items:list, total_usd:str) -> str:
+async def render_wallet_screenshot(playwright, items:list, total_usd:str, total_pct:float=0.0) -> str:
+    # items: [{SYMBOL, AMOUNT, PRICE, VALUE, CHANGE_PCT, H24}]
+    mapped = []
+    for it in items:
+        mapped.append({
+            "ICON": icon_for(it["SYMBOL"]),
+            "SYMBOL": it["SYMBOL"],
+            "CHAIN": CHAIN_LABEL.get(it["SYMBOL"], "BNB Smart Chain"),
+            "AMOUNT": it["AMOUNT"],
+            "PRICE": it["PRICE"],
+            "VALUE": it["VALUE"],
+            "H24": it.get("H24"),
+            "CHANGE_PCT": it["CHANGE_PCT"],
+        })
+
     html = Template(WALLET_TEMPLATE).render(
-        NOW=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         TOTAL_USD=total_usd,
-        ITEMS=items
+        TOTAL_PCT=total_pct,
+        ITEMS=mapped
     )
+
     path_html = "wallet.html"
     with open(path_html, "w", encoding="utf-8") as f:
         f.write(html)
 
     browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-    ctx = await browser.new_context(viewport={"width": 420, "height": 800}, device_scale_factor=2)
+    # iPhone-ish
+    ctx = await browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2)
     page = await ctx.new_page()
     await page.goto("file://" + os.path.abspath(path_html))
     height = await page.evaluate("document.documentElement.scrollHeight")
-    await page.set_viewport_size({"width": 420, "height": height})
+    await page.set_viewport_size({"width": 390, "height": height})
     out = "wallet.png"
     await page.screenshot(path=out, full_page=True)
     await ctx.close()
@@ -318,7 +411,9 @@ async def compute_snapshot(user_id:int):
     async with aiohttp.ClientSession() as sess:
         prices, source = await fetch_prices(sess)
 
-    pzro, pbnb, pusdt = prices["ZRO"], prices["BNB"], prices["USDT"]
+    pzro, pbnb, pusdt = prices["ZRO"]["price"], prices["BNB"]["price"], prices["USDT"]["price"]
+    zro24, bnb24, usdt24 = prices["ZRO"]["h24"], prices["BNB"]["h24"], prices["USDT"]["h24"]
+
     bzro, bbnb, busdt = prof["baseline_zro"], prof["baseline_bnb"], prof["baseline_usdt"]
 
     def pct(now, base):
@@ -327,25 +422,36 @@ async def compute_snapshot(user_id:int):
         return round((now - base) / base * 100, 2)
 
     rows = []
+    # Порядок: ZRO (норм), BNB, USDT, ZRO (пустышка)
     entries = [
-        ("ZRO", prof["zro"], pzro, pct(pzro, bzro)),
-        ("BNB", prof["bnb"], pbnb, pct(pbnb, bbnb)),
-        ("USDT", prof["usdt"], pusdt, pct(pusdt, busdt)),
-        ("ZRO", prof["fzro"], pzro, pct(pzro, bzro)),  # fZRO как ZRO
+        ("ZRO", prof["zro"], pzro, pct(pzro, bzro), zro24),
+        ("BNB", prof["bnb"], pbnb, pct(pbnb, bbnb), bnb24),
+        ("USDT", prof["usdt"], pusdt, pct(pusdt, busdt), usdt24),
+        ("ZRO", prof["fzro"], pzro, pct(pzro, bzro), zro24),
     ]
     total = 0.0
-    for sym, amount, price, change in entries:
-        value = round(amount * price, 2)
+    weighted_parts = []
+    for sym, amount, price, change, h24 in entries:
+        value_f = amount * price
+        value = round(value_f, 2)
         total += value
+        weighted_parts.append((value_f, change))
         rows.append({
             "SYMBOL": sym,
             "AMOUNT": f"{amount:g}",
             "PRICE": f"{price:,.4f}".replace(",", " "),
             "VALUE": f"{value:,.2f}".replace(",", " "),
-            "CHANGE_PCT": change
+            "CHANGE_PCT": change,
+            "H24": None if h24 is None else round(float(h24), 2)
         })
+
     total_str = f"{total:,.2f}".replace(",", " ")
-    return {"rows": rows, "total": total_str, "source": source}, None
+    # Взвешенный портфельный % относительно "базы"
+    total_pct = 0.0
+    if total > 0:
+        total_pct = round(sum(v/total * c for v, c in weighted_parts), 2)
+
+    return {"rows": rows, "total": total_str, "total_pct": total_pct, "source": source}, None
 
 
 # ---------- Планировщик ----------
@@ -364,11 +470,12 @@ def schedule_user_job(user_id:int, hour:int, minute:int, bot: Bot, playwright):
         if err:
             await bot.send_message(user_id, err, reply_markup=menu_kb())
             return
-        path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
+        path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
         cap = f"Плановый снимок {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        if snap.get("source") == "cache":
+        src = snap.get("source")
+        if src == "cache":
             cap += " • цены из кэша"
-        elif snap.get("source") == "binance":
+        elif src == "binance":
             cap += " • цены: Binance"
         await bot.send_photo(user_id, FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
@@ -394,7 +501,7 @@ PLAYWRIGHT = None  # глобальный инстанс Playwright
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     await m.answer(
-        "Привет! Я делаю скриншоты кошелька с ценами ZRO/BNB/USDT и fZRO.\n"
+        "Привет! Я делаю скриншоты кошелька с ценами ZRO/BNB/USDT и fZRO в стиле Trust Wallet.\n"
         "Используйте кнопки ниже или команды:\n"
         "• /setup — задать количества и (опц.) время\n"
         "• /shot — скрин сейчас\n"
@@ -419,11 +526,11 @@ async def cmd_setup(m: Message):
     try:
         async with aiohttp.ClientSession() as sess:
             prices, source = await fetch_prices(sess)
-    except Exception as e:
+    except Exception:
         await m.answer("Не удалось получить цены. Попробуйте ещё раз /setup.", reply_markup=menu_kb())
         return
 
-    baselines = {"ZRO": prices["ZRO"], "BNB": prices["BNB"], "USDT": prices["USDT"]}
+    baselines = {k: prices[k]["price"] for k in ("ZRO","BNB","USDT")}
     upsert_profile(m.from_user.id, amounts, baselines, sched)
 
     if sched:
@@ -474,10 +581,11 @@ async def cmd_prices(m: Message):
     if err:
         await m.answer(err, reply_markup=menu_kb())
         return
-    lines = [f"Итоговая оценка: ${snap['total']}"]
+    lines = [f"Итоговая оценка: ${snap['total']}  ({'+' if snap.get('total_pct',0)>=0 else ''}{snap.get('total_pct',0)}% от базы)"]
     for r in snap["rows"]:
         sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
-        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}%")
+        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{r.get('H24')}%" if r.get("H24") is not None else ""
+        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}% от базы{h24}")
     src = snap.get("source")
     if src == "cache":
         lines.append("⚠️ Цены взяты из кэша.")
@@ -492,7 +600,7 @@ async def cmd_shot(m: Message):
     if err:
         await m.answer(err, reply_markup=menu_kb())
         return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
+    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
     cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     src = snap.get("source")
     if src == "cache":
@@ -534,7 +642,7 @@ async def cb_send_shot(c: CallbackQuery):
     if err:
         await c.message.answer(err, reply_markup=menu_kb())
         return
-    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
+    path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"], snap.get("total_pct", 0.0))
     cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     src = snap.get("source")
     if src == "cache":
@@ -548,10 +656,11 @@ async def cb_send_prices(c: CallbackQuery):
     if err:
         await c.message.answer(err, reply_markup=menu_kb())
         return
-    lines = [f"Итоговая оценка: ${snap['total']}"]
+    lines = [f"Итоговая оценка: ${snap['total']}  ({'+' if snap.get('total_pct',0)>=0 else ''}{snap.get('total_pct',0)}% от базы)"]
     for r in snap["rows"]:
         sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
-        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}%")
+        h24 = f" • 24ч {('+' if (r.get('H24') or 0)>=0 else '')}{r.get('H24')}%" if r.get("H24") is not None else ""
+        lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}% от базы{h24}")
     src = snap.get("source")
     if src == "cache":
         lines.append("⚠️ Цены взяты из кэша.")

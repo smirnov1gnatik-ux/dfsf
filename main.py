@@ -1,11 +1,16 @@
-from typing import Optional, Tuple
-import subprocess
-from shutil import which
-from pathlib import Path
+# main.py
+# ------------------------------------------------------------
+# Telegram-бот: скриншот "Trust-like Wallet" (ZRO/BNB/USDT + fZRO)
+# Кнопки, учёт количеств, проценты от базовой цены, плановые отправки.
+# Источники цен: Binance (приоритет) -> CoinGecko -> локальный кэш.
+# Работает с aiogram 3.7+, Playwright с авто-доустановкой Chromium.
+# ------------------------------------------------------------
+
 import asyncio
 import json
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -27,32 +32,32 @@ from playwright.async_api import async_playwright
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN в настройках Render.")
+    raise RuntimeError("BOT_TOKEN не задан. Добавьте переменную окружения BOT_TOKEN.")
 
-# CoinGecko IDs
 COINGECKO_IDS = {"ZRO": "layerzero", "BNB": "binancecoin", "USDT": "tether"}
 
 DB_PATH = "bot.db"
 CACHE_PATH = Path("prices_cache.json")
-CACHE_TTL_SECONDS = 180  # 3 минуты кэш на случай 429
+CACHE_TTL_SECONDS = 180  # 3 минуты
+PLAYWRIGHT_BROWSERS_PATH = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
 # ===============================================
 
+
+# ---------- Установка Chromium (без root) ----------
 def ensure_playwright_chromium():
-    # Если бинарь уже скачан — ничего не делаем
-    cache_dir = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright"))
-    if cache_dir.exists() and any(cache_dir.rglob("headless_shell")):
-        return
-    # Если playwright не найден, это странно — но попробуем установить заново
+    # Если Chromium уже скачан — ничего не делаем
     try:
-        subprocess.run(
-            ["python", "-m", "playwright", "install", "--with-deps", "chromium"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        if PLAYWRIGHT_BROWSERS_PATH.exists() and any(PLAYWRIGHT_BROWSERS_PATH.rglob("headless_shell")):
+            return
+    except Exception:
+        pass
+    # Доустановка браузера (без --with-deps, чтобы не требовался root)
+    try:
+        print("Installing Playwright Chromium…")
+        subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
     except subprocess.CalledProcessError as e:
-        # В лог выведем, но работу не прерываем — бот может дальше жить (скрин не получится, но всё остальное да)
-        print("Playwright install failed:", e.stdout.decode("utf-8", errors="ignore"))
+        print("Playwright install failed with code", e.returncode)
+
 
 # ---------- База данных ----------
 def db_init():
@@ -114,11 +119,12 @@ def upsert_profile(user_id: int, amounts: dict, baselines: dict, schedule_time: 
             baselines.get("ZRO"),
             baselines.get("BNB"),
             baselines.get("USDT"),
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             schedule_time[0] if schedule_time else None,
             schedule_time[1] if schedule_time else None,
         ))
         con.commit()
+
 
 # ---------- Кэш цен ----------
 def _cache_read() -> Optional[dict]:
@@ -138,13 +144,11 @@ def _cache_write(prices: dict):
     except Exception:
         pass
 
-# ---------- Цены с ретраями и кэшем ----------
+
+# ---------- Цены: Binance -> CoinGecko -> кэш ----------
 async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
     """
-    Пытаемся так:
-      A) Binance (BNBUSDT, ZROUSDT; USDT=1)
-      B) CoinGecko (с ретраями и кэшем)
-    Возвращаем (prices, source) где source in {'binance','live','cache'}.
+    Возвращает (prices, source): source in {'binance','coingecko','cache'}
     """
     # --- A) Binance ---
     try:
@@ -157,9 +161,9 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
             _cache_write(prices)
             return prices, "binance"
     except Exception:
-        pass  # пойдём в CoinGecko + кэш
+        pass
 
-    # --- B) CoinGecko с ретраями и кэшем ---
+    # --- B) CoinGecko с ретраями ---
     ids = ",".join(COINGECKO_IDS.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
     backoffs = [0.5, 1.2, 2.5, 5.0]
@@ -176,10 +180,10 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
                     "USDT": float(data[COINGECKO_IDS["USDT"]]["usd"]),
                 }
                 _cache_write(prices)
-                return prices, "live"
+                return prices, "coingecko"
         except aiohttp.ClientResponseError:
             if i < len(backoffs) - 1:
-                await asyncio.sleep(delay);  # подождём и попробуем снова
+                await asyncio.sleep(delay)
                 continue
             cached = _cache_read()
             if cached:
@@ -191,8 +195,14 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
                 return cached, "cache"
             raise
 
+    # --- C) вообще ничего не вышло ---
+    cached = _cache_read()
+    if cached:
+        return cached, "cache"
+    raise RuntimeError("Нет источника цен")
 
-# ---------- HTML-шаблон «скриншота» ----------
+
+# ---------- HTML-шаблон скриншота ----------
 WALLET_TEMPLATE = """
 <!doctype html>
 <html lang="ru"><head>
@@ -243,7 +253,7 @@ WALLET_TEMPLATE = """
 
 async def render_wallet_screenshot(playwright, items:list, total_usd:str) -> str:
     html = Template(WALLET_TEMPLATE).render(
-        NOW=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        NOW=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         TOTAL_USD=total_usd,
         ITEMS=items
     )
@@ -263,11 +273,48 @@ async def render_wallet_screenshot(playwright, items:list, total_usd:str) -> str
     await browser.close()
     return out
 
-# ---------- Логика портфеля ----------
+
+# ---------- Бизнес-логика ----------
+def parse_setup(body: str):
+    """
+    Пример:
+    ZRO 750.034
+    BNB 0.01
+    USDT 0
+    fZRO 1040
+    at 18:30
+    """
+    amounts = {"ZRO":0.0,"BNB":0.0,"USDT":0.0,"fZRO":0.0}
+    hour = minute = None
+    for raw in body.splitlines():
+        s = raw.strip()
+        if not s: 
+            continue
+        low = s.lower()
+        if low.startswith("at "):
+            try:
+                hh, mm = low.replace("at","",1).strip().split(":")
+                hour, minute = int(hh), int(mm)
+            except Exception:
+                pass
+            continue
+        parts = s.replace(",", ".").split()
+        if len(parts) >= 2:
+            key = parts[0].upper()
+            try:
+                val = float(parts[1])
+            except Exception:
+                continue
+            if key in ("ZRO","BNB","USDT","FZRO"):
+                amounts["fZRO" if key=="FZRO" else key] = val
+    sched = (hour, minute) if hour is not None and minute is not None else None
+    return amounts, sched
+
 async def compute_snapshot(user_id:int):
     prof = get_profile(user_id)
     if not prof:
         return None, "Сначала выполните /setup — укажите количества токенов."
+
     async with aiohttp.ClientSession() as sess:
         prices, source = await fetch_prices(sess)
 
@@ -300,6 +347,7 @@ async def compute_snapshot(user_id:int):
     total_str = f"{total:,.2f}".replace(",", " ")
     return {"rows": rows, "total": total_str, "source": source}, None
 
+
 # ---------- Планировщик ----------
 scheduler = AsyncIOScheduler()
 
@@ -317,12 +365,15 @@ def schedule_user_job(user_id:int, hour:int, minute:int, bot: Bot, playwright):
             await bot.send_message(user_id, err, reply_markup=menu_kb())
             return
         path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
-        cap = f"Плановый снимок {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        cap = f"Плановый снимок {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         if snap.get("source") == "cache":
             cap += " • цены из кэша"
+        elif snap.get("source") == "binance":
+            cap += " • цены: Binance"
         await bot.send_photo(user_id, FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
     scheduler.add_job(job, trigger, id=job_id)
+
 
 # ---------- Кнопки ----------
 def menu_kb():
@@ -334,6 +385,7 @@ def menu_kb():
             InlineKeyboardButton(text="⏰ Задать время", callback_data="set_time_utc"),
         ],
     ])
+
 
 # ---------- Бот ----------
 dp = Dispatcher()
@@ -368,8 +420,7 @@ async def cmd_setup(m: Message):
         async with aiohttp.ClientSession() as sess:
             prices, source = await fetch_prices(sess)
     except Exception as e:
-        # вообще не прерываем: если совсем нет цен — подскажем и выйдем
-        await m.answer(f"Не удалось получить цены ни из Binance, ни из CoinGecko. Попробуйте ещё раз /setup.", reply_markup=menu_kb())
+        await m.answer("Не удалось получить цены. Попробуйте ещё раз /setup.", reply_markup=menu_kb())
         return
 
     baselines = {"ZRO": prices["ZRO"], "BNB": prices["BNB"], "USDT": prices["USDT"]}
@@ -385,38 +436,10 @@ async def cmd_setup(m: Message):
         f"USDT: {amounts['USDT']}\n"
         f"fZRO: {amounts['fZRO']}\n"
         f"Базовые цены (USD): ZRO={baselines['ZRO']:.4f}, BNB={baselines['BNB']:.4f}, USDT={baselines['USDT']:.4f}\n"
-        f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='live' else 'кэш')}\n"
+        f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='coingecko' else 'кэш')}\n"
     )
     msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC." if sched else "Плановая отправка не задана (можно /time HH:MM)."
     await m.answer(msg, reply_markup=menu_kb())
-
-
-def parse_setup(body: str):
-    amounts = {"ZRO":0.0,"BNB":0.0,"USDT":0.0,"fZRO":0.0}
-    hour = minute = None
-    for raw in body.splitlines():
-        s = raw.strip()
-        if not s: 
-            continue
-        low = s.lower()
-        if low.startswith("at "):
-            try:
-                hh, mm = low.replace("at","",1).strip().split(":")
-                hour, minute = int(hh), int(mm)
-            except Exception:
-                pass
-            continue
-        parts = s.replace(",", ".").split()
-        if len(parts) >= 2:
-            key = parts[0].upper()
-            try:
-                val = float(parts[1])
-            except Exception:
-                continue
-            if key in ("ZRO","BNB","USDT","FZRO"):
-                amounts["fZRO" if key=="FZRO" else key] = val
-    sched = (hour, minute) if hour is not None and minute is not None else None
-    return amounts, sched
 
 @dp.message(Command("time"))
 async def cmd_time(m: Message):
@@ -455,8 +478,11 @@ async def cmd_prices(m: Message):
     for r in snap["rows"]:
         sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
         lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}%")
-    if snap.get("source") == "cache":
-        lines.append("⚠️ Цены взяты из кэша (CoinGecko временно ограничил запросы).")
+    src = snap.get("source")
+    if src == "cache":
+        lines.append("⚠️ Цены взяты из кэша.")
+    elif src == "binance":
+        lines.append("Источник цен: Binance.")
     await m.answer("\n".join(lines), reply_markup=menu_kb())
 
 @dp.message(Command("shot"))
@@ -467,9 +493,12 @@ async def cmd_shot(m: Message):
         await m.answer(err, reply_markup=menu_kb())
         return
     path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
-    cap = f"Портфель на {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-    if snap.get("source") == "cache":
+    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    src = snap.get("source")
+    if src == "cache":
         cap += " • цены из кэша"
+    elif src == "binance":
+        cap += " • цены: Binance"
     await m.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
 # ---------- Обработчики кнопок ----------
@@ -506,9 +535,12 @@ async def cb_send_shot(c: CallbackQuery):
         await c.message.answer(err, reply_markup=menu_kb())
         return
     path = await render_wallet_screenshot(PLAYWRIGHT, snap["rows"], snap["total"])
-    cap = f"Портфель на {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-    if snap.get("source") == "cache":
+    cap = f"Портфель на {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    src = snap.get("source")
+    if src == "cache":
         cap += " • цены из кэша"
+    elif src == "binance":
+        cap += " • цены: Binance"
     await c.message.answer_photo(FSInputFile(path), caption=cap, reply_markup=menu_kb())
 
 async def cb_send_prices(c: CallbackQuery):
@@ -520,9 +552,13 @@ async def cb_send_prices(c: CallbackQuery):
     for r in snap["rows"]:
         sgn = "+" if r["CHANGE_PCT"] >= 0 else ""
         lines.append(f"{r['SYMBOL']}: {r['AMOUNT']} шт • ${r['PRICE']}/шт • ${r['VALUE']} • {sgn}{r['CHANGE_PCT']}%")
-    if snap.get("source") == "cache":
-        lines.append("⚠️ Цены взяты из кэша (CoinGecko временно ограничил запросы).")
+    src = snap.get("source")
+    if src == "cache":
+        lines.append("⚠️ Цены взяты из кэша.")
+    elif src == "binance":
+        lines.append("Источник цен: Binance.")
     await c.message.answer("\n".join(lines), reply_markup=menu_kb())
+
 
 # ---------- Жизненный цикл ----------
 PLAYWRIGHT = None
@@ -530,13 +566,7 @@ PLAYWRIGHT = None
 async def on_startup():
     global PLAYWRIGHT
     db_init()
-async def on_startup():
-    global PLAYWRIGHT
-    db_init()
-    ensure_playwright_chromium()   # <--- добавьте эту строку
-    PLAYWRIGHT = await async_playwright().start()
-    if not scheduler.running:
-        scheduler.start()
+    ensure_playwright_chromium()
     PLAYWRIGHT = await async_playwright().start()
     if not scheduler.running:
         scheduler.start()

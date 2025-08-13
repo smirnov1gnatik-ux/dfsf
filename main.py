@@ -400,7 +400,6 @@ async def main():
     await on_startup()
     try:
         bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        await Dispatcher.set_current(dp)  # на всякий случай, если окружение требует
         await dp.start_polling(bot)
     finally:
         await on_shutdown()

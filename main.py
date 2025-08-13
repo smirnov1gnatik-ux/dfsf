@@ -1,3 +1,4 @@
+from typing import Optional, Tuple
 import asyncio
 import json
 import os
@@ -120,20 +121,33 @@ def _cache_write(prices: dict):
 # ---------- Цены с ретраями и кэшем ----------
 async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
     """
-    Возвращает (prices, source), где source='live' или 'cache'
+    Пытаемся так:
+      A) Binance (BNBUSDT, ZROUSDT; USDT=1)
+      B) CoinGecko (с ретраями и кэшем)
+    Возвращаем (prices, source) где source in {'binance','live','cache'}.
     """
+    # --- A) Binance ---
+    try:
+        async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", timeout=15) as r1, \
+                   session.get("https://api.binance.com/api/v3/ticker/price?symbol=ZROUSDT", timeout=15) as r2:
+            r1.raise_for_status(); r2.raise_for_status()
+            bnb = float((await r1.json())["price"])
+            zro = float((await r2.json())["price"])
+            prices = {"ZRO": zro, "BNB": bnb, "USDT": 1.0}
+            _cache_write(prices)
+            return prices, "binance"
+    except Exception:
+        pass  # пойдём в CoinGecko + кэш
+
+    # --- B) CoinGecko с ретраями и кэшем ---
     ids = ",".join(COINGECKO_IDS.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-
-    # попробуем до 4 ретраев при 429/5xx
     backoffs = [0.5, 1.2, 2.5, 5.0]
     for i, delay in enumerate(backoffs):
         try:
             async with session.get(url, timeout=25) as r:
                 if r.status == 429 or 500 <= r.status < 600:
-                    raise aiohttp.ClientResponseError(
-                        r.request_info, r.history, status=r.status, message="rate/5xx", headers=r.headers
-                    )
+                    raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message="rate/5xx", headers=r.headers)
                 r.raise_for_status()
                 data = await r.json()
                 prices = {
@@ -143,23 +157,20 @@ async def fetch_prices(session: aiohttp.ClientSession) -> Tuple[dict, str]:
                 }
                 _cache_write(prices)
                 return prices, "live"
-        except aiohttp.ClientResponseError as e:
+        except aiohttp.ClientResponseError:
             if i < len(backoffs) - 1:
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay);  # подождём и попробуем снова
                 continue
-            # после ретраев попробуем кэш
             cached = _cache_read()
             if cached:
                 return cached, "cache"
-            else:
-                raise
+            raise
         except Exception:
-            # при сетевых ошибках тоже фолбэк к кэшу
             cached = _cache_read()
             if cached:
                 return cached, "cache"
-            else:
-                raise
+            raise
+
 
 # ---------- HTML-шаблон «скриншота» ----------
 WALLET_TEMPLATE = """
@@ -337,7 +348,8 @@ async def cmd_setup(m: Message):
         async with aiohttp.ClientSession() as sess:
             prices, source = await fetch_prices(sess)
     except Exception as e:
-        await m.answer(f"Не удалось получить цены: {e}", reply_markup=menu_kb())
+        # вообще не прерываем: если совсем нет цен — подскажем и выйдем
+        await m.answer(f"Не удалось получить цены ни из Binance, ни из CoinGecko. Попробуйте ещё раз /setup.", reply_markup=menu_kb())
         return
 
     baselines = {"ZRO": prices["ZRO"], "BNB": prices["BNB"], "USDT": prices["USDT"]}
@@ -353,13 +365,11 @@ async def cmd_setup(m: Message):
         f"USDT: {amounts['USDT']}\n"
         f"fZRO: {amounts['fZRO']}\n"
         f"Базовые цены (USD): ZRO={baselines['ZRO']:.4f}, BNB={baselines['BNB']:.4f}, USDT={baselines['USDT']:.4f}\n"
-        f"Источник цен: {'онлайн' if source=='live' else 'кэш'}\n"
+        f"Источник цен: {'Binance' if source=='binance' else ('CoinGecko' if source=='live' else 'кэш')}\n"
     )
-    if sched:
-        msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC."
-    else:
-        msg += "Плановая отправка не задана (можно /time HH:MM)."
+    msg += f"Плановая отправка ежедневно в {sched[0]:02d}:{sched[1]:02d} UTC." if sched else "Плановая отправка не задана (можно /time HH:MM)."
     await m.answer(msg, reply_markup=menu_kb())
+
 
 def parse_setup(body: str):
     amounts = {"ZRO":0.0,"BNB":0.0,"USDT":0.0,"fZRO":0.0}
